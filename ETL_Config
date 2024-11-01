@@ -2,54 +2,82 @@
 $config = Get-Content -Path "./config.json" | ConvertFrom-Json
 $serverName = $config.ServerName
 $databaseName = $config.DatabaseName
-$payorName = $config.PayorName
-$sourcePath = $config.SourcePath
-$destinationPath = $config.DestinationPath
-$logFile = "./logs/etl_log.txt"
+$sourceDataPath = $config.SourceDataPath
+$logFile = $config.LogFilePath
 
 # Start logging
 Add-Content -Path $logFile -Value "ETL Process Started: $(Get-Date)"
 
-# Load mappings from SQL Server
-$query = Get-Content -Path "./mappings/data_mapping.sql" -Raw | ForEach-Object {$_ -replace "@PayorName", "'$payorName'"}
-$mappingConfig = Invoke-Sqlcmd -ServerInstance $serverName -Database $databaseName -Query $query
+# Process each payor folder
+foreach ($payorFolder in Get-ChildItem -Path $sourceDataPath -Directory) {
+    $payorName = $payorFolder.Name
+    $payorFolderPath = $payorFolder.FullName
 
-# Check if mappings were retrieved
-if ($mappingConfig -eq $null) {
-    Add-Content -Path $logFile -Value "No mappings retrieved for PayorName: $payorName"
-    exit
-}
+    # Retrieve data mappings for the current payor
+    $query = "SELECT incomingcolumnanme, standardizedcolumnname, isrequired 
+              FROM ETL.Claim_data_mapping 
+              WHERE PayorName = '$payorName'"
+    $mappingConfig = Invoke-Sqlcmd -ServerInstance $serverName -Database $databaseName -Query $query
 
-# Load source data
-$sourceData = Import-Csv -Path $sourcePath
-$transformedData = @()
-
-# Transform each row based on mapping
-foreach ($row in $sourceData) {
-    $transformedRow = @{}
-    $isValid = $true
-
-    foreach ($map in $mappingConfig) {
-        $sourceColumn = $map.incomingcolumnanme
-        $targetColumn = $map.standardizedcolumnname
-        $isRequired = $map.isrequired
-
-        if ($isRequired -and -not $row.PSObject.Properties[$sourceColumn]) {
-            Add-Content -Path $logFile -Value "Missing required field: $sourceColumn"
-            $isValid = $false
-            continue
-        }
-
-        if ($row.PSObject.Properties[$sourceColumn]) {
-            $transformedRow[$targetColumn] = $row.$sourceColumn
-        }
+    if ($mappingConfig.Count -eq 0) {
+        Add-Content -Path $logFile -Value "No mappings found for Payor: $payorName"
+        continue
     }
 
-    if ($isValid) {
-        $transformedData += New-Object PSObject -Property $transformedRow
+    # Process each file in the current payor folder
+    foreach ($file in Get-ChildItem -Path $payorFolderPath -Filter *.csv) {
+        $sourceFileName = $file.Name
+        $sourceData = Import-Csv -Path $file.FullName
+        $transformedData = @()
+
+        # Transform each row based on mapping
+        foreach ($row in $sourceData) {
+            $columnNames = @()
+            $values = @()
+            $isValid = $true
+
+            foreach ($map in $mappingConfig) {
+                $sourceColumn = $map.incomingcolumnanme
+                $targetColumn = $map.standardizedcolumnname
+                $isRequired = $map.isrequired
+
+                # Check if required fields are present
+                if ($isRequired -and -not $row.PSObject.Properties[$sourceColumn]) {
+                    Add-Content -Path $logFile -Value "Missing required field: $sourceColumn in file $sourceFileName, payor $payorName"
+                    $isValid = $false
+                    break
+                }
+
+                # Add transformed values
+                if ($row.PSObject.Properties[$sourceColumn]) {
+                    $columnNames += $targetColumn
+                    $values += "'" + $row.$sourceColumn.Replace("'", "''") + "'"
+                }
+            }
+
+            # Add SourceFileName to the transformed data
+            $columnNames += "SourceFileName"
+            $values += "'" + $sourceFileName.Replace("'", "''") + "'"
+
+            # Insert transformed row into SQL Server if valid
+            if ($isValid) {
+                $columnsString = [string]::Join(",", $columnNames)
+                $valuesString = [string]::Join(",", $values)
+
+                $insertQuery = "INSERT INTO $databaseName.YourDestinationTable ($columnsString) VALUES ($valuesString)"
+                try {
+                    Invoke-Sqlcmd -ServerInstance $serverName -Database $databaseName -Query $insertQuery
+                    Add-Content -Path $logFile -Value "Row inserted from $sourceFileName in $payorName"
+                } catch {
+                    Add-Content -Path $logFile -Value "Error inserting row from $sourceFileName in $payorName: $_"
+                }
+            }
+        }
+
+        # Log completion of each file processing
+        Add-Content -Path $logFile -Value "Completed processing file: $sourceFileName for Payor: $payorName"
     }
 }
 
-# Save transformed data to the destination
-$transformedData | Export-Csv -Path $destinationPath -NoTypeInformation
+# Log completion of the ETL process
 Add-Content -Path $logFile -Value "ETL Process Completed: $(Get-Date)"
