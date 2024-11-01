@@ -1,0 +1,55 @@
+# Load configuration
+$config = Get-Content -Path "./config.json" | ConvertFrom-Json
+$serverName = $config.ServerName
+$databaseName = $config.DatabaseName
+$payorName = $config.PayorName
+$sourcePath = $config.SourcePath
+$destinationPath = $config.DestinationPath
+$logFile = "./logs/etl_log.txt"
+
+# Start logging
+Add-Content -Path $logFile -Value "ETL Process Started: $(Get-Date)"
+
+# Load mappings from SQL Server
+$query = Get-Content -Path "./mappings/data_mapping.sql" -Raw | ForEach-Object {$_ -replace "@PayorName", "'$payorName'"}
+$mappingConfig = Invoke-Sqlcmd -ServerInstance $serverName -Database $databaseName -Query $query
+
+# Check if mappings were retrieved
+if ($mappingConfig -eq $null) {
+    Add-Content -Path $logFile -Value "No mappings retrieved for PayorName: $payorName"
+    exit
+}
+
+# Load source data
+$sourceData = Import-Csv -Path $sourcePath
+$transformedData = @()
+
+# Transform each row based on mapping
+foreach ($row in $sourceData) {
+    $transformedRow = @{}
+    $isValid = $true
+
+    foreach ($map in $mappingConfig) {
+        $sourceColumn = $map.incomingcolumnanme
+        $targetColumn = $map.standardizedcolumnname
+        $isRequired = $map.isrequired
+
+        if ($isRequired -and -not $row.PSObject.Properties[$sourceColumn]) {
+            Add-Content -Path $logFile -Value "Missing required field: $sourceColumn"
+            $isValid = $false
+            continue
+        }
+
+        if ($row.PSObject.Properties[$sourceColumn]) {
+            $transformedRow[$targetColumn] = $row.$sourceColumn
+        }
+    }
+
+    if ($isValid) {
+        $transformedData += New-Object PSObject -Property $transformedRow
+    }
+}
+
+# Save transformed data to the destination
+$transformedData | Export-Csv -Path $destinationPath -NoTypeInformation
+Add-Content -Path $logFile -Value "ETL Process Completed: $(Get-Date)"
