@@ -1,0 +1,90 @@
+from docx import Document
+
+# Create a new Document
+doc = Document()
+
+# Title
+doc.add_heading('ETL Project', level=1)
+
+# Project Structure
+doc.add_heading('Project Structure', level=2)
+doc.add_paragraph("""
+The ETL project is organized as follows:
+
+ETL_Project/
+├── config/                                # Configuration folder
+│   ├── config_Anthem.json                 # JSON config for Anthem payor
+│   ├── config_Cigna.json                  # JSON config for Cigna payor
+│   └── config_template.json               # Template JSON config for reuse
+├── sql/                                   # Folder for SQL query files
+│   └── get_data_mapping.sql               # SQL query for retrieving data mappings
+├── scripts/                               # Folder for main ETL scripts
+│   ├── ETL_Anthem.ps1                     # PowerShell script for Anthem ETL
+│   └── ETL_template.ps1                   # Template PowerShell script for reuse
+├── functions/                             # Reusable PowerShell functions
+│   ├── ImportFile.ps1                     # Function to import .csv, .txt, or .xlsx files
+│   ├── TransformData.ps1                  # Function to apply transformations
+│   ├── LoadData.ps1                       # Function to load data into SQL Server
+│   ├── ArchiveFile.ps1                    # Function to archive files after processing
+│   └── UtilityFunctions.ps1               # General utility functions
+└── logs/                                  # Folder for log files
+    └── ETL_Anthem.log                     # Log file for Anthem ETL process
+""")
+
+# Configuration Files
+doc.add_heading('Configuration Files', level=2)
+doc.add_paragraph("""
+Each payor has a JSON configuration file in the config folder. Here’s an example for Anthem:
+
+{
+    "ServerName": "your_server_name",
+    "DatabaseName": "ClaimsStage",
+    "MappingTable": "ETL.Claim_data_mapping",
+    "SourceDataPath": "C:/Helix/Claims/Anthem",
+    "LogFilePath": "./logs/ETL_Anthem.log",
+    "DestinationTable": "YourDestinationTable",
+    "MemberFileKeyword": "member",
+    "ArchivePath": "C:/Helix/Claims/Anthem/Archive"
+}
+
+Replace placeholders such as your_server_name and YourDestinationTable with the correct values.
+""")
+
+# SQL Query File
+doc.add_heading('SQL Query File', level=2)
+doc.add_paragraph("""
+The SQL query to retrieve data mappings is located in the sql folder.
+
+-- sql/get_data_mapping.sql
+SELECT incomingcolumnname, standardizedcolumnname, isrequired 
+FROM ETL.Claim_data_mapping 
+WHERE PayorName = @PayorName;
+
+The @PayorName parameter will be dynamically replaced by the payor name in the ETL script.
+""")
+
+# Main ETL Script Explanation
+doc.add_heading('Main ETL Script Explanation', level=2)
+doc.add_paragraph("""
+1. **Load Configuration**: Loads the payor-specific configuration (e.g., server details, paths) from the JSON file.
+
+2. **Data Mapping Retrieval**: Runs the SQL query to retrieve the column mappings from the `Claim_data_mapping` table, using the payor name.
+
+3. **File Processing**:
+   - Searches for files containing the specified keyword (e.g., “member”) in the payor's directory.
+   - Each file is read and validated against the mapping configuration.
+
+4. **Transformation**: Transforms each file based on the mappings retrieved from SQL Server. Logs any missing required fields.
+
+5. **Data Loading**: Inserts the transformed data into the destination SQL Server table.
+
+6. **Archiving**: Moves processed files to an archive folder structure based on date (e.g., `Archive/2024/11`).
+
+7. **Logging**: Logs each step to track progress, errors, and completion.
+""")
+
+# Save document
+doc_path = "/mnt/data/ETL_Project_ReadMe.docx"
+doc.save(doc_path)
+
+doc_path
