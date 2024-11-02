@@ -1,0 +1,11 @@
+function ImportFile {
+    param (
+        [string]$FilePath
+    )
+    $fileExtension = [System.IO.Path]::GetExtension($FilePath)
+    switch ($fileExtension) {
+        ".csv" { return Import-Csv -Path $FilePath }
+        ".txt" { return Import-Csv -Path $FilePath -Delimiter "`t" }
+        ".xlsx" { return Import-Excel -Path $FilePath }  # Assumes ImportExcel module is installed
+    }
+}
