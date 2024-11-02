@@ -1,0 +1,11 @@
+function ArchiveFile {
+    param (
+        [string]$FilePath,
+        [string]$ArchivePath
+    )
+
+    $datePath = Join-Path -Path $ArchivePath -ChildPath (Get-Date -Format "yyyy/MM")
+    if (-not (Test-Path -Path $datePath)) { New-Item -ItemType Directory -Path $datePath }
+
+    Move-Item -Path $FilePath -Destination $datePath
+}
