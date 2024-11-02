@@ -1,0 +1,43 @@
+# Load configuration
+$config = Get-Content -Path "./config/config_Anthem.json" | ConvertFrom-Json
+
+# Import functions
+. ../functions/ImportFile.ps1
+. ../functions/TransformData.ps1
+. ../functions/LoadData.ps1
+. ../functions/ArchiveFile.ps1
+. ../functions/UtilityFunctions.ps1
+
+# Start logging
+LogMessage -LogFilePath $config.LogFilePath -Message "ETL Process Started for Member Files: $(Get-Date)"
+
+# Define the keyword to filter member files
+$memberKeyword = $config.MemberFileKeyword
+
+# Process each file in the payor folder containing the keyword
+foreach ($file in Get-ChildItem -Path $config.SourceDataPath -Filter *$memberKeyword*.*) {
+    $sourceFileName = $file.Name
+    LogMessage -LogFilePath $config.LogFilePath -Message "Processing file: $sourceFileName"
+
+    # Import the SQL query
+    $query = Get-Content -Path "../sql/get_data_mapping.sql" -Raw
+    $query = $query -replace "@PayorName", "'Anthem'"  # Replace with the current payor name
+
+    # Retrieve data mappings
+    $mappingConfig = Invoke-Sqlcmd -ServerInstance $config.ServerName -Database $config.DatabaseName -Query $query
+
+    if ($mappingConfig.Count -eq 0) {
+        LogMessage -LogFilePath $config.LogFilePath -Message "No mappings found for Payor: Anthem"
+        continue
+    }
+
+    # Import, transform, and load data
+    $data = ImportFile -FilePath $file.FullName
+    $transformedData = TransformData -Data $data -MappingConfig $mappingConfig
+    LoadData -Data $transformedData -Config $config -SourceFileName $sourceFileName
+
+    # Archive the processed file
+    ArchiveFile -FilePath $file.FullName -ArchivePath $config.ArchivePath
+}
+
+LogMessage -LogFilePath $config.LogFilePath -Message "ETL Process Completed: $(Get-Date)"
