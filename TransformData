@@ -1,0 +1,29 @@
+function TransformData {
+    param (
+        [array]$Data,
+        [array]$MappingConfig
+    )
+
+    $transformedData = @()
+    foreach ($row in $Data) {
+        $newRow = @{}
+        $isValid = $true
+
+        foreach ($map in $MappingConfig) {
+            $sourceColumn = $map.incomingcolumnname
+            $targetColumn = $map.standardizedcolumnname
+            $isRequired = $map.isrequired
+
+            if ($isRequired -and -not $row.$sourceColumn) {
+                $isValid = $false
+                break
+            }
+
+            $newRow[$targetColumn] = $row.$sourceColumn
+        }
+
+        if ($isValid) { $transformedData += $newRow }
+    }
+
+    return $transformedData
+}
