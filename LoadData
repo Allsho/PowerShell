@@ -1,0 +1,15 @@
+function LoadData {
+    param (
+        [array]$Data,
+        [psobject]$Config,
+        [string]$SourceFileName
+    )
+
+    foreach ($row in $Data) {
+        $columns = $row.Keys -join ","
+        $values = ($row.Values | ForEach-Object { "'$_'" }) -join ","
+        $insertQuery = "INSERT INTO $($Config.DestinationTable) ($columns, SourceFileName) VALUES ($values, '$SourceFileName')"
+
+        Invoke-Sqlcmd -ServerInstance $Config.ServerName -Database $Config.DatabaseName -Query $insertQuery
+    }
+}
