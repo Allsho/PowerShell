@@ -1,0 +1,7 @@
+function LogMessage {
+    param (
+        [string]$LogFilePath,
+        [string]$Message
+    )
+    Add-Content -Path $LogFilePath -Value $Message
+}
