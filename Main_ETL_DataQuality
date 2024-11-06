@@ -1,73 +1,102 @@
-# Load configuration
+# Step 1: Load Configuration
+Write-Host "Step 1: Loading configuration for Anthem..."
+if (-Not (Test-Path "./config/config_Anthem.json")) {
+    Write-Host "Error: Configuration file './config/config_Anthem.json' not found!" -ForegroundColor Red
+    exit
+}
 $config = Get-Content -Path "./config/config_Anthem.json" | ConvertFrom-Json
+Write-Host "Loaded configuration for Anthem: $($config | ConvertTo-Json -Depth 3)"
 
-# Import functions
-. ../functions/ImportFile.ps1
-. ../functions/TransformData.ps1
-. ../functions/LoadData.ps1
-. ../functions/ArchiveFile.ps1
-. ../functions/UtilityFunctions.ps1
+# Step 2: Determine Script Directory for Function Imports
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
+Write-Host "Step 2: Script Directory set to '$scriptDir'"
 
-# Start logging
-LogMessage -LogFilePath $config.LogFilePath -Message "ETL Process Started for Member Files: $(Get-Date)"
+# Step 3: Verify Function Files Exist
+Write-Host "Step 3: Checking if function files exist..."
+$functionPaths = @(
+    "$scriptDir/../functions/ImportFile.ps1",
+    "$scriptDir/../functions/TransformData.ps1",
+    "$scriptDir/../functions/LoadData.ps1",
+    "$scriptDir/../functions/ArchiveFile.ps1",
+    "$scriptDir/../functions/UtilityFunctions.ps1"
+)
 
-# Define the keyword to filter member files
-$memberKeyword = $config.MemberFileKeyword
-
-# Function to execute SQL query using System.Data.SqlClient
-function Get-SqlData {
-    param (
-        [string]$ServerName,
-        [string]$DatabaseName,
-        [string]$Query
-    )
-
-    $connectionString = "Server=$ServerName;Database=$DatabaseName;Integrated Security=True;"
-    $connection = New-Object System.Data.SqlClient.SqlConnection($connectionString)
-
-    try {
-        $connection.Open()
-        $command = $connection.CreateCommand()
-        $command.CommandText = $Query
-
-        $adapter = New-Object System.Data.SqlClient.SqlDataAdapter $command
-        $dataTable = New-Object System.Data.DataTable
-        $adapter.Fill($dataTable)
-        return $dataTable
-    }
-    catch {
-        LogMessage -LogFilePath $config.LogFilePath -Message "Error retrieving data: $($_.Exception.Message)"
-        throw
-    }
-    finally {
-        $connection.Close()
+foreach ($path in $functionPaths) {
+    if (-Not (Test-Path $path)) {
+        Write-Host "Error: Function file not found at $path" -ForegroundColor Red
+        exit
+    } else {
+        Write-Host "Verified function file: $path"
     }
 }
+Write-Host "All function files verified successfully."
 
-# Process each file in the payor folder containing the keyword
+# Step 4: Import Functions
+Write-Host "Step 4: Importing function files..."
+. "$scriptDir/../functions/ImportFile.ps1"
+. "$scriptDir/../functions/TransformData.ps1"
+. "$scriptDir/../functions/LoadData.ps1"
+. "$scriptDir/../functions/ArchiveFile.ps1"
+. "$scriptDir/../functions/UtilityFunctions.ps1"
+Write-Host "Function files imported successfully."
+
+# Step 5: Start Logging
+Write-Host "Step 5: Starting logging for ETL process..."
+LogMessage -LogFilePath $config.LogFilePath -Message "ETL Process Started for Member Files: $(Get-Date)"
+Write-Host "ETL Process log entry created for start time: $(Get-Date)"
+
+# Step 6: Define Keyword for Member Files
+Write-Host "Step 6: Defining keyword for member files..."
+$memberKeyword = $config.MemberFileKeyword
+Write-Host "Keyword for member files set to: '$memberKeyword'"
+
+# Step 7: Process Each File in the Payor Folder
+Write-Host "Step 7: Processing files in source data path..."
 foreach ($file in Get-ChildItem -Path $config.SourceDataPath -Filter *$memberKeyword*.*) {
     $sourceFileName = $file.Name
+    Write-Host "Processing file: $sourceFileName"
     LogMessage -LogFilePath $config.LogFilePath -Message "Processing file: $sourceFileName"
 
-    # Import the SQL query
-    $query = Get-Content -Path "../sql/get_data_mapping.sql" -Raw
-    $query = $query -replace "@PayorName", "'Anthem'"  # Replace with the current payor name
+    # Step 8: Load SQL Query and Replace Placeholder
+    Write-Host "Step 8: Loading SQL query for data mapping..."
+    $query = Get-Content -Path "$scriptDir/../sql/get_data_mapping.sql" -Raw
+    $query = $query -replace "@PayorName", "'Anthem'"
+    Write-Host "SQL query loaded and PayorName placeholder replaced."
 
-    # Retrieve data mappings
+    # Step 9: Retrieve Data Mappings
+    Write-Host "Step 9: Retrieving data mappings from database..."
     $mappingConfig = Get-SqlData -ServerName $config.ServerName -DatabaseName $config.DatabaseName -Query $query
 
     if ($mappingConfig.Rows.Count -eq 0) {
+        Write-Host "No mappings found for Payor: Anthem" -ForegroundColor Yellow
         LogMessage -LogFilePath $config.LogFilePath -Message "No mappings found for Payor: Anthem"
         continue
+    } else {
+        Write-Host "Data mappings retrieved successfully."
     }
 
-    # Import, transform, and load data
+    # Step 10: Import File Data
+    Write-Host "Step 10: Importing data from file..."
     $data = ImportFile -FilePath $file.FullName
-    $transformedData = TransformData -Data $data -MappingConfig $mappingConfig
-    LoadData -Data $transformedData -Config $config -SourceFileName $sourceFileName
+    Write-Host "Data imported from file: $sourceFileName"
 
-    # Archive the processed file
+    # Step 11: Transform Data
+    Write-Host "Step 11: Transforming data..."
+    $transformedData = TransformData -Data $data -MappingConfig $mappingConfig
+    Write-Host "Data transformed successfully for file: $sourceFileName"
+
+    # Step 12: Load Data into SQL Server
+    Write-Host "Step 12: Loading transformed data into SQL Server..."
+    LoadData -Data $transformedData -Config $config -SourceFileName $sourceFileName
+    Write-Host "Data loaded into SQL Server for file: $sourceFileName"
+
+    # Step 13: Archive Processed File
+    Write-Host "Step 13: Archiving processed file..."
     ArchiveFile -FilePath $file.FullName -ArchivePath $config.ArchivePath
+    Write-Host "File archived: $sourceFileName"
 }
 
+# Step 14: Complete Logging for ETL Process
+Write-Host "Step 14: Completing logging for ETL process..."
 LogMessage -LogFilePath $config.LogFilePath -Message "ETL Process Completed: $(Get-Date)"
+Write-Host "ETL Process completed at: $(Get-Date)"
