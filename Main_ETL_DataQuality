@@ -31,8 +31,40 @@ foreach ($path in $functionPaths) {
 }
 Write-Host "All function files verified successfully."
 
-# Step 4: Import Functions
-Write-Host "Step 4: Importing function files..."
+# Step 4: Define Get-SqlData Function
+Write-Host "Step 4: Defining Get-SqlData function..."
+function Get-SqlData {
+    param (
+        [string]$ServerName,
+        [string]$DatabaseName,
+        [string]$Query
+    )
+
+    $connectionString = "Server=$ServerName;Database=$DatabaseName;Integrated Security=True;"
+    $connection = New-Object System.Data.SqlClient.SqlConnection($connectionString)
+
+    try {
+        $connection.Open()
+        $command = $connection.CreateCommand()
+        $command.CommandText = $Query
+
+        $adapter = New-Object System.Data.SqlClient.SqlDataAdapter $command
+        $dataTable = New-Object System.Data.DataTable
+        $adapter.Fill($dataTable)
+        return $dataTable
+    }
+    catch {
+        LogMessage -LogFilePath $config.LogFilePath -Message "Error retrieving data: $($_.Exception.Message)"
+        throw
+    }
+    finally {
+        $connection.Close()
+    }
+}
+Write-Host "Get-SqlData function defined successfully."
+
+# Step 5: Import Functions
+Write-Host "Step 5: Importing function files..."
 . "$scriptDir/../functions/ImportFile.ps1"
 . "$scriptDir/../functions/TransformData.ps1"
 . "$scriptDir/../functions/LoadData.ps1"
@@ -40,31 +72,31 @@ Write-Host "Step 4: Importing function files..."
 . "$scriptDir/../functions/UtilityFunctions.ps1"
 Write-Host "Function files imported successfully."
 
-# Step 5: Start Logging
-Write-Host "Step 5: Starting logging for ETL process..."
+# Step 6: Start Logging
+Write-Host "Step 6: Starting logging for ETL process..."
 LogMessage -LogFilePath $config.LogFilePath -Message "ETL Process Started for Member Files: $(Get-Date)"
 Write-Host "ETL Process log entry created for start time: $(Get-Date)"
 
-# Step 6: Define Keyword for Member Files
-Write-Host "Step 6: Defining keyword for member files..."
+# Step 7: Define Keyword for Member Files
+Write-Host "Step 7: Defining keyword for member files..."
 $memberKeyword = $config.MemberFileKeyword
 Write-Host "Keyword for member files set to: '$memberKeyword'"
 
-# Step 7: Process Each File in the Payor Folder
-Write-Host "Step 7: Processing files in source data path..."
+# Step 8: Process Each File in the Payor Folder
+Write-Host "Step 8: Processing files in source data path..."
 foreach ($file in Get-ChildItem -Path $config.SourceDataPath -Filter *$memberKeyword*.*) {
     $sourceFileName = $file.Name
     Write-Host "Processing file: $sourceFileName"
     LogMessage -LogFilePath $config.LogFilePath -Message "Processing file: $sourceFileName"
 
-    # Step 8: Load SQL Query and Replace Placeholder
-    Write-Host "Step 8: Loading SQL query for data mapping..."
+    # Step 9: Load SQL Query and Replace Placeholder
+    Write-Host "Step 9: Loading SQL query for data mapping..."
     $query = Get-Content -Path "$scriptDir/../sql/get_data_mapping.sql" -Raw
     $query = $query -replace "@PayorName", "'Anthem'"
     Write-Host "SQL query loaded and PayorName placeholder replaced."
 
-    # Step 9: Retrieve Data Mappings
-    Write-Host "Step 9: Retrieving data mappings from database..."
+    # Step 10: Retrieve Data Mappings
+    Write-Host "Step 10: Retrieving data mappings from database..."
     $mappingConfig = Get-SqlData -ServerName $config.ServerName -DatabaseName $config.DatabaseName -Query $query
 
     if ($mappingConfig.Rows.Count -eq 0) {
@@ -75,28 +107,28 @@ foreach ($file in Get-ChildItem -Path $config.SourceDataPath -Filter *$memberKey
         Write-Host "Data mappings retrieved successfully."
     }
 
-    # Step 10: Import File Data
-    Write-Host "Step 10: Importing data from file..."
+    # Step 11: Import File Data
+    Write-Host "Step 11: Importing data from file..."
     $data = ImportFile -FilePath $file.FullName
     Write-Host "Data imported from file: $sourceFileName"
 
-    # Step 11: Transform Data
-    Write-Host "Step 11: Transforming data..."
+    # Step 12: Transform Data
+    Write-Host "Step 12: Transforming data..."
     $transformedData = TransformData -Data $data -MappingConfig $mappingConfig
     Write-Host "Data transformed successfully for file: $sourceFileName"
 
-    # Step 12: Load Data into SQL Server
-    Write-Host "Step 12: Loading transformed data into SQL Server..."
+    # Step 13: Load Data into SQL Server
+    Write-Host "Step 13: Loading transformed data into SQL Server..."
     LoadData -Data $transformedData -Config $config -SourceFileName $sourceFileName
     Write-Host "Data loaded into SQL Server for file: $sourceFileName"
 
-    # Step 13: Archive Processed File
-    Write-Host "Step 13: Archiving processed file..."
+    # Step 14: Archive Processed File
+    Write-Host "Step 14: Archiving processed file..."
     ArchiveFile -FilePath $file.FullName -ArchivePath $config.ArchivePath
     Write-Host "File archived: $sourceFileName"
 }
 
-# Step 14: Complete Logging for ETL Process
-Write-Host "Step 14: Completing logging for ETL process..."
+# Step 15: Complete Logging for ETL Process
+Write-Host "Step 15: Completing logging for ETL process..."
 LogMessage -LogFilePath $config.LogFilePath -Message "ETL Process Completed: $(Get-Date)"
 Write-Host "ETL Process completed at: $(Get-Date)"
