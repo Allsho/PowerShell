@@ -20,50 +20,49 @@ Write-Host "Step 3: Importing function files..."
 . "$scriptDir/../functions/TransformData.ps1"
 . "$scriptDir/../functions/LoadData.ps1"
 . "$scriptDir/../functions/ArchiveFile.ps1"
+. "$scriptDir/MappingDebug.ps1"
 Write-Host "Function files imported successfully."
 
-# Step 4: Start ETL Process
-Write-Host "Step 4: Starting ETL process for member files..."
+# Step 4: Validate Mapping Configuration
+Write-Host "Step 4: Validating mapping configuration..."
+$query = Get-Content -Path "$scriptDir/../sql/get_data_mapping.sql" -Raw
+$query = $query -replace "@PayorName", "'Anthem'"
+Validate-MappingConfig -ServerName $config.ServerName -DatabaseName $config.DatabaseName -Query $query -LogFilePath "./debug_log.txt"
+
+# Step 5: Define and Start ETL Process
+Write-Host "Step 5: Starting ETL process for member files..."
 $memberKeyword = $config.MemberFileKeyword
 
-# Process each file in the specified folder
 foreach ($file in Get-ChildItem -Path $config.SourceDataPath -Filter *$memberKeyword*.*) {
-    $sourceFileName = $file.Name
-    Write-Host "Processing file: $sourceFileName"
-
-    # Step 5: Load SQL Query for Data Mapping
-    Write-Host "Step 5: Loading SQL query for data mapping..."
-    $query = Get-Content -Path "$scriptDir/../sql/get_data_mapping.sql" -Raw
-    $query = $query -replace "@PayorName", "'Anthem'"
-
-    # Step 6: Retrieve Data Mappings
-    Write-Host "Step 6: Retrieving data mappings from database..."
-    $mappingConfig = Get-SqlData -ServerName $config.ServerName -DatabaseName $config.DatabaseName -Query $query
-
-    if ($null -eq $mappingConfig -or $mappingConfig.Rows.Count -eq 0) {
-        Write-Host "Warning: No mappings found for Payor: Anthem" -ForegroundColor Yellow
+    Write-Host "Processing file: $($file.Name)"
+    
+    # Step 5.1: Import File
+    $importedData = ImportFile -FilePath $file.FullName
+    if ($null -eq $importedData) {
+        Write-Host "Error: Failed to import file $($file.Name). Skipping to the next file."
         continue
     }
+    Write-Host "File imported successfully. Data row count: $($importedData.Rows.Count)"
     
-    # Step 7: Import File Data
-    Write-Host "Step 7: Importing data from file..."
-    $data = ImportFile -FilePath $file.FullName
-    Write-Host "Data imported from file: $sourceFileName"
-
-    # Step 8: Transform Data
-    Write-Host "Step 8: Transforming data..."
-    $transformedData = TransformData -Data $data -MappingConfig $mappingConfig
-    Write-Host "Data transformed successfully for file: $sourceFileName"
-
-    # Step 9: Load Data into SQL Server
-    Write-Host "Step 9: Loading transformed data into SQL Server..."
-    LoadData -Data $transformedData -Config $config -SourceFileName $sourceFileName
-    Write-Host "Data loaded into SQL Server for file: $sourceFileName"
-
-    # Step 10: Archive Processed File
-    Write-Host "Step 10: Archiving processed file..."
+    # Step 5.2: Transform Data
+    $transformedData = TransformData -Data $importedData -MappingConfig $mappingConfig
+    if ($null -eq $transformedData) {
+        Write-Host "Error: Transformation failed for file $($file.Name). Skipping to the next file."
+        continue
+    }
+    Write-Host "Data transformation complete. Transformed row count: $($transformedData.Rows.Count)"
+    
+    # Step 5.3: Load Data
+    $loadResult = LoadData -ServerName $config.ServerName -DatabaseName $config.DatabaseName -TableName $config.DestinationTable -Data $transformedData
+    if ($loadResult -eq $false) {
+        Write-Host "Error: Loading data failed for file $($file.Name). Skipping to the next file."
+        continue
+    }
+    Write-Host "Data loaded successfully into $($config.DestinationTable)."
+    
+    # Step 5.4: Archive File
     ArchiveFile -FilePath $file.FullName -ArchivePath $config.ArchivePath
-    Write-Host "File archived: $sourceFileName"
+    Write-Host "File archived successfully: $($file.Name)"
 }
 
-Write-Host "ETL Process completed."
+Write-Host "ETL Process completed successfully."
