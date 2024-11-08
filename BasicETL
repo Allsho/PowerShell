@@ -14,53 +14,62 @@ function Execute-SqlQuery {
     param (
         [string]$query
     )
-    
-    $connection = New-Object System.Data.SqlClient.SqlConnection
-    $connection.ConnectionString = $ConnectionString
-    $command = $connection.CreateCommand()
-    $command.CommandText = $query
 
-    $connection.Open()
-    $reader = $command.ExecuteReader()
-    
-    # Capture the query results in a DataTable
-    $table = New-Object System.Data.DataTable
-    $table.Load($reader)
-    
-    $connection.Close()
-    return $table
+    try {
+        $connection = New-Object System.Data.SqlClient.SqlConnection
+        $connection.ConnectionString = $ConnectionString
+        $command = $connection.CreateCommand()
+        $command.CommandText = $query
+
+        $connection.Open()
+        $reader = $command.ExecuteReader()
+
+        # Capture the query results in a DataTable
+        $table = New-Object System.Data.DataTable
+        $table.Load($reader)
+
+        $connection.Close()
+        return $table
+    }
+    catch {
+        Write-Output "Error executing SQL query: $($_.Exception.Message)"
+        return $null
+    }
 }
 
 # Step 1: Fetch Data Mapping
 $mappingQuery = "SELECT SourceColumnIndex, TargetColumnName FROM $DataMappingTable WHERE TargetTable = '$TargetTable'"
 $columnMappings = Execute-SqlQuery -query $mappingQuery
 
+if (-not $columnMappings) {
+    Write-Output "Failed to retrieve column mappings. Exiting script."
+    exit
+}
+
 # Step 2: Process the Anthem file
 if (Test-Path -Path $FilePath) {
-    # Read all lines from the text file
     $lines = Get-Content -Path $FilePath
-
-    # Create a list to hold SQL insert statements
     $insertStatements = @()
 
-    # Skip the header (if present) and loop through each data line
+    # Skip header and process each line
     foreach ($line in $lines[1..$lines.Length]) {
-        # Split the line based on the delimiter
         $columns = $line -split $Delimiter
-
-        # Generate an insert statement based on mappings
         $columnNames = @()
         $values = @()
         
         foreach ($mapping in $columnMappings.Rows) {
-            # Extract column index and name from mapping
             $sourceIndex = [int]$mapping["SourceColumnIndex"]
             $targetColumn = $mapping["TargetColumnName"]
 
-            # Retrieve the column value from the file and prepare for SQL insert
-            $value = $columns[$sourceIndex] -replace "'", "''"  # Escape single quotes
-            $columnNames += $targetColumn
-            $values += "'$value'"
+            # Ensure the source index is within the bounds of the columns array
+            if ($sourceIndex -lt $columns.Length) {
+                $value = $columns[$sourceIndex] -replace "'", "''"  # Escape single quotes
+                $columnNames += $targetColumn
+                $values += "'$value'"
+            }
+            else {
+                Write-Output "Warning: Source index $sourceIndex out of bounds for line: $line"
+            }
         }
 
         # Construct SQL Insert Statement
@@ -69,24 +78,35 @@ if (Test-Path -Path $FilePath) {
     }
 
     # Step 3: Insert Data into Target Table
-    $connection = New-Object System.Data.SqlClient.SqlConnection
-    $connection.ConnectionString = $ConnectionString
-    $connection.Open()
-
-    foreach ($statement in $insertStatements) {
-        $command = $connection.CreateCommand()
-        $command.CommandText = $statement
-        try {
-            $command.ExecuteNonQuery() | Out-Null
-            Write-Output "Inserted: $statement"
+    try {
+        $connection = New-Object System.Data.SqlClient.SqlConnection
+        $connection.ConnectionString = $ConnectionString
+        $connection.Open()
+        
+        foreach ($statement in $insertStatements) {
+            $command = $connection.CreateCommand()
+            $command.CommandText = $statement
+            if ($command -ne $null) {
+                try {
+                    $command.ExecuteNonQuery() | Out-Null
+                    Write-Output "Inserted: $statement"
+                }
+                catch {
+                    Write-Output "Error inserting data: $($_.Exception.Message)"
+                }
+            }
+            else {
+                Write-Output "Error: Command object is null. Check SQL connection and statement syntax."
+            }
         }
-        catch {
-            Write-Output "Error inserting data: $($_.Exception.Message)"
-        }
+        
+        $connection.Close()
+    }
+    catch {
+        Write-Output "Error with SQL connection or execution: $($_.Exception.Message)"
     }
     
-    $connection.Close()
-    Write-Output "Data load completed successfully."
+    Write-Output "Data load completed."
 } else {
     Write-Output "File not found at path: $FilePath"
 }
