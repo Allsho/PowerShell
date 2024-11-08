@@ -3,25 +3,31 @@ $ServerName = "YourServerName"
 $Database = "YourDatabase"
 $FilePath = "C:\path\to\your\anthemfile.txt"
 $Delimiter = "|"  # Adjust based on your file's delimiter
-$DataMappingTable = "dbo.DataMapping"
-$TargetTable = "Anthem.MemberShip"
+$DataMappingTable = "dbo.DataMapping"  # Table for mapping information
+$TargetTable = "Anthem.MemberShip"  # Target table for data load
 
-# Step 1: Fetch Column Mappings using sqlcmd
-$mappingQuery = "SELECT SourceColumnIndex, TargetColumnName FROM $DataMappingTable WHERE TargetTable = '$TargetTable'"
-$MappingResults = & sqlcmd -S $ServerName -d $Database -Q $mappingQuery -W -s"," | ForEach-Object {
-    $parts = $_ -split ","
-    [PSCustomObject]@{
-        SourceColumnIndex = $parts[0]
-        TargetColumnName = $parts[1]
-    }
-}
+# Fetching Column Mappings Using sqlcmd
+$MappingResults = & sqlcmd -S $ServerName -d $Database -Q "SELECT SourceColumnIndex, TargetColumnName FROM $DataMappingTable WHERE TargetTable = '$TargetTable'" -W -s"," | Out-String
+$MappingLines = $MappingResults -split "`r?`n" | Where-Object { $_ -match "," }
 
-if (-not $MappingResults) {
+# Ensure mappings were retrieved
+if (-not $MappingLines) {
     Write-Output "Failed to retrieve column mappings. Exiting script."
     exit
 }
 
-# Step 2: Process the Anthem file
+# Parse the mapping results into a dictionary
+$Mappings = @{}
+foreach ($line in $MappingLines) {
+    $parts = $line -split ","
+    if ($parts.Count -eq 2) {
+        $SourceIndex = [int]$parts[0].Trim()
+        $TargetColumn = $parts[1].Trim()
+        $Mappings[$SourceIndex] = $TargetColumn
+    }
+}
+
+# Step 2: Process the Anthem file and create SQL statements
 if (Test-Path -Path $FilePath) {
     $lines = Get-Content -Path $FilePath
     $sqlStatements = @()
@@ -32,18 +38,14 @@ if (Test-Path -Path $FilePath) {
         $columnNames = @()
         $values = @()
 
-        foreach ($mapping in $MappingResults) {
-            $sourceIndex = [int]$mapping.SourceColumnIndex
-            $targetColumn = $mapping.TargetColumnName
+        foreach ($sourceIndex in $Mappings.Keys) {
+            $targetColumn = $Mappings[$sourceIndex]
 
             # Ensure the source index is within the bounds of the columns array
             if ($sourceIndex -lt $columns.Length) {
                 $value = $columns[$sourceIndex] -replace "'", "''"  # Escape single quotes
                 $columnNames += $targetColumn
                 $values += "'$value'"
-            }
-            else {
-                Write-Output "Warning: Source index $sourceIndex out of bounds for line: $line"
             }
         }
 
