@@ -2,73 +2,68 @@
 $ServerName = "YourServerName"
 $Database = "YourDatabase"
 $FilePath = "C:\path\to\your\anthemfile.txt"
-$Delimiter = "|"  # Adjust based on your file's delimiter
-$DataMappingTable = "dbo.DataMapping"  # Table for mapping information
-$TargetTable = "Anthem.MemberShip"  # Target table for data load
+$Delimiter = "|"
+$PayorName = "Anthem"
+$TargetTable = "Anthem.MemberShip"
 
-# Fetching Column Mappings Using sqlcmd
-$MappingResults = & sqlcmd -S $ServerName -d $Database -Q "SELECT SourceColumnIndex, TargetColumnName FROM $DataMappingTable WHERE TargetTable = '$TargetTable'" -W -s"," | Out-String
+# Fetch mappings for the specified PayorName
+$MappingQuery = "SELECT IncomingColumnName, StandardizedColumnName FROM dbo.DataMapping WHERE PayorName = '$PayorName'"
+$MappingResults = & sqlcmd -S $ServerName -d $Database -Q $MappingQuery -W -s"," | Out-String
 $MappingLines = $MappingResults -split "`r?`n" | Where-Object { $_ -match "," }
 
-# Ensure mappings were retrieved
 if (-not $MappingLines) {
-    Write-Output "Failed to retrieve column mappings. Exiting script."
+    Write-Output "Failed to retrieve column mappings for PayorName: $PayorName. Exiting script."
     exit
 }
 
-# Parse the mapping results into a dictionary
+# Parse mappings into a dictionary
 $Mappings = @{}
 foreach ($line in $MappingLines) {
     $parts = $line -split ","
     if ($parts.Count -eq 2) {
-        $SourceIndex = [int]$parts[0].Trim()
-        $TargetColumn = $parts[1].Trim()
-        $Mappings[$SourceIndex] = $TargetColumn
+        $IncomingColumn = $parts[0].Trim()
+        $StandardizedColumn = $parts[1].Trim()
+        $Mappings[$IncomingColumn] = $StandardizedColumn
     }
 }
 
-# Step 2: Process the Anthem file and create SQL statements
+# Process the file and create SQL statements
 if (Test-Path -Path $FilePath) {
     $lines = Get-Content -Path $FilePath
     $sqlStatements = @()
 
-    # Skip header and process each line
     foreach ($line in $lines[1..$lines.Length]) {
         $columns = $line -split $Delimiter
         $columnNames = @()
         $values = @()
 
-        foreach ($sourceIndex in $Mappings.Keys) {
-            $targetColumn = $Mappings[$sourceIndex]
+        # Loop through each column in the file
+        foreach ($IncomingColumnName in $Mappings.Keys) {
+            $StandardizedColumnName = $Mappings[$IncomingColumnName]
 
-            # Ensure the source index is within the bounds of the columns array
-            if ($sourceIndex -lt $columns.Length) {
-                $value = $columns[$sourceIndex] -replace "'", "''"  # Escape single quotes
-                $columnNames += $targetColumn
+            # Map incoming data to the standardized column name
+            $columnIndex = [array]::IndexOf($lines[0] -split $Delimiter, $IncomingColumnName)
+            if ($columnIndex -lt $columns.Length -and $columnIndex -ge 0) {
+                $value = $columns[$columnIndex]
+                $columnNames += "[$StandardizedColumnName]"
                 $values += "'$value'"
             }
         }
 
-        # Construct SQL Insert Statement
-        $sqlStatement = "INSERT INTO $TargetTable (" + ($columnNames -join ", ") + ") VALUES (" + ($values -join ", ") + ");"
+        # Build the SQL INSERT statement for each line
+        $sqlStatement = "INSERT INTO $TargetTable (" + ($columnNames -join ", ") + ") VALUES (" + ($values -join ", ") + ")"
         $sqlStatements += $sqlStatement
     }
 
-    # Step 3: Write SQL Statements to a Temporary SQL File
-    $tempSqlFile = "$env:TEMP\InsertStatements.sql"
-    $sqlStatements -join "`n" | Set-Content -Path $tempSqlFile -Force
-
-    # Step 4: Execute the SQL File using sqlcmd
-    try {
-        & sqlcmd -S $ServerName -d $Database -i $tempSqlFile
-        Write-Output "Data load completed."
+    # Execute each SQL statement
+    foreach ($sqlStatement in $sqlStatements) {
+        try {
+            & sqlcmd -S $ServerName -d $Database -Q $sqlStatement
+            Write-Output "Inserted data successfully."
+        } catch {
+            Write-Output "Error inserting data: $_"
+        }
     }
-    catch {
-        Write-Output "Error inserting data: $($_.Exception.Message)"
-    }
-    
-    # Clean up
-    Remove-Item -Path $tempSqlFile -Force
 } else {
-    Write-Output "File not found at path: $FilePath"
+    Write-Output "File not found: $FilePath"
 }
