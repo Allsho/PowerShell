@@ -28,56 +28,94 @@ foreach ($line in $MappingLines) {
 
 # Check if file exists
 if (Test-Path -Path $FilePath) {
-    # Import the CSV file (no need for -Quote parameter, it's handled by Import-Csv)
+    # Check if the file is a single-column CSV or multi-column CSV
     $csvContent = Import-Csv -Path $FilePath -Delimiter ','
 
-    $sqlStatements = @()
+    # Check if the file has only one column or more
+    if ($csvContent[0].PSObject.Properties.Count -eq 1) {
+        # Single column case (no commas)
+        $columnNames = $Mappings.Values
+        $rowBatch = @()
+        $batchSize = 100  # Adjust batch size as needed for optimal performance
 
-    # Accumulate multiple rows into one INSERT statement
-    $rowBatch = @()
-    $batchSize = 100  # Adjust batch size as needed for optimal performance
+        foreach ($row in $csvContent) {
+            $value = $row.PSObject.Properties[0].Value
+            $values = @()
+            $columnNames | ForEach-Object { $values += "'$value'" }
 
-    # Loop through each row in the CSV
-    foreach ($row in $csvContent) {
-        $columnNames = @()
-        $values = @()
+            # Add the current row's values to the batch
+            $rowBatch += "(" + ($values -join ", ") + ")"
 
-        # Loop through each column in the row
-        foreach ($IncomingColumnName in $Mappings.Keys) {
-            $StandardizedColumnName = $Mappings[$IncomingColumnName]
-
-            # Check if the IncomingColumnName exists in the row
-            if ($row.PSObject.Properties[$IncomingColumnName]) {
-                $value = $row.$IncomingColumnName
-                $columnNames += "[$StandardizedColumnName]"
-                $values += "'$value'"
+            # If batch size is reached, insert the batch
+            if ($rowBatch.Count -ge $batchSize) {
+                $sqlStatement = "INSERT INTO $TargetTable (" + ($Mappings.Values -join ", ") + ") VALUES " + ($rowBatch -join ", ")
+                try {
+                    & sqlcmd -S $ServerName -d $Database -Q $sqlStatement
+                    Write-Output "Inserted batch of data successfully."
+                } catch {
+                    Write-Output "Error inserting data: $_"
+                }
+                $rowBatch.Clear()  # Clear the batch after insertion
             }
         }
 
-        # Add the current row's values to the batch
-        $rowBatch += "(" + ($values -join ", ") + ")"
+        # Insert any remaining rows
+        if ($rowBatch.Count -gt 0) {
+            $sqlStatement = "INSERT INTO $TargetTable (" + ($Mappings.Values -join ", ") + ") VALUES " + ($rowBatch -join ", ")
+            try {
+                & sqlcmd -S $ServerName -d $Database -Q $sqlStatement
+                Write-Output "Inserted batch of data successfully."
+            } catch {
+                Write-Output "Error inserting data: $_"
+            }
+        }
+    } else {
+        # Multi-column case (with commas)
+        $sqlStatements = @()
+        $rowBatch = @()
+        $batchSize = 100  # Adjust batch size as needed for optimal performance
 
-        # If batch size is reached, insert the batch
-        if ($rowBatch.Count -ge $batchSize) {
+        foreach ($row in $csvContent) {
+            $columnNames = @()
+            $values = @()
+
+            # Loop through each column in the row and map it
+            foreach ($IncomingColumnName in $Mappings.Keys) {
+                $StandardizedColumnName = $Mappings[$IncomingColumnName]
+
+                # Check if the IncomingColumnName exists in the row
+                if ($row.PSObject.Properties[$IncomingColumnName]) {
+                    $value = $row.$IncomingColumnName
+                    $columnNames += "[$StandardizedColumnName]"
+                    $values += "'$value'"
+                }
+            }
+
+            # Add the current row's values to the batch
+            $rowBatch += "(" + ($values -join ", ") + ")"
+
+            # If batch size is reached, insert the batch
+            if ($rowBatch.Count -ge $batchSize) {
+                $sqlStatement = "INSERT INTO $TargetTable (" + ($columnNames -join ", ") + ") VALUES " + ($rowBatch -join ", ")
+                $sqlStatements += $sqlStatement
+                $rowBatch.Clear()  # Clear the batch after insertion
+            }
+        }
+
+        # Insert any remaining rows
+        if ($rowBatch.Count -gt 0) {
             $sqlStatement = "INSERT INTO $TargetTable (" + ($columnNames -join ", ") + ") VALUES " + ($rowBatch -join ", ")
             $sqlStatements += $sqlStatement
-            $rowBatch.Clear()  # Clear the batch after insertion
         }
-    }
 
-    # Insert any remaining rows that didn't fill up the batch
-    if ($rowBatch.Count -gt 0) {
-        $sqlStatement = "INSERT INTO $TargetTable (" + ($columnNames -join ", ") + ") VALUES " + ($rowBatch -join ", ")
-        $sqlStatements += $sqlStatement
-    }
-
-    # Execute the batched SQL statements
-    foreach ($sqlStatement in $sqlStatements) {
-        try {
-            & sqlcmd -S $ServerName -d $Database -Q $sqlStatement
-            Write-Output "Inserted batch of data successfully."
-        } catch {
-            Write-Output "Error inserting data: $_"
+        # Execute the batched SQL statements
+        foreach ($sqlStatement in $sqlStatements) {
+            try {
+                & sqlcmd -S $ServerName -d $Database -Q $sqlStatement
+                Write-Output "Inserted batch of data successfully."
+            } catch {
+                Write-Output "Error inserting data: $_"
+            }
         }
     }
 } else {
