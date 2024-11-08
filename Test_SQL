@@ -1,0 +1,17 @@
+# Define SQL Server connection details
+$ServerName = "YourServerName"
+$Database = "YourDatabase"
+
+# Test SQL Server connection with a simple query
+try {
+    $result = & sqlcmd -S $ServerName -d $Database -Q "SELECT @@VERSION;" -W
+    if ($result) {
+        Write-Output "Connection successful. SQL Server version:"
+        Write-Output $result
+    } else {
+        Write-Output "No result returned. Check if the database exists and permissions are correct."
+    }
+}
+catch {
+    Write-Output "Error connecting to SQL Server: $($_.Exception.Message)"
+}
