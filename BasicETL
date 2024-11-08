@@ -28,10 +28,14 @@ foreach ($line in $MappingLines) {
 
 # Check if file exists
 if (Test-Path -Path $FilePath) {
-    # Import the CSV file
-    $csvContent = Import-Csv -Path $FilePath -Delimiter ',' -Quote '"' 
+    # Import the CSV file (no need for -Quote parameter, it's handled by Import-Csv)
+    $csvContent = Import-Csv -Path $FilePath -Delimiter ','
 
     $sqlStatements = @()
+
+    # Accumulate multiple rows into one INSERT statement
+    $rowBatch = @()
+    $batchSize = 100  # Adjust batch size as needed for optimal performance
 
     # Loop through each row in the CSV
     foreach ($row in $csvContent) {
@@ -50,16 +54,28 @@ if (Test-Path -Path $FilePath) {
             }
         }
 
-        # Build the SQL INSERT statement for each row
-        $sqlStatement = "INSERT INTO $TargetTable (" + ($columnNames -join ", ") + ") VALUES (" + ($values -join ", ") + ")"
+        # Add the current row's values to the batch
+        $rowBatch += "(" + ($values -join ", ") + ")"
+
+        # If batch size is reached, insert the batch
+        if ($rowBatch.Count -ge $batchSize) {
+            $sqlStatement = "INSERT INTO $TargetTable (" + ($columnNames -join ", ") + ") VALUES " + ($rowBatch -join ", ")
+            $sqlStatements += $sqlStatement
+            $rowBatch.Clear()  # Clear the batch after insertion
+        }
+    }
+
+    # Insert any remaining rows that didn't fill up the batch
+    if ($rowBatch.Count -gt 0) {
+        $sqlStatement = "INSERT INTO $TargetTable (" + ($columnNames -join ", ") + ") VALUES " + ($rowBatch -join ", ")
         $sqlStatements += $sqlStatement
     }
 
-    # Execute each SQL statement
+    # Execute the batched SQL statements
     foreach ($sqlStatement in $sqlStatements) {
         try {
             & sqlcmd -S $ServerName -d $Database -Q $sqlStatement
-            Write-Output "Inserted data successfully."
+            Write-Output "Inserted batch of data successfully."
         } catch {
             Write-Output "Error inserting data: $_"
         }
