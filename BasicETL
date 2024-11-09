@@ -1,8 +1,7 @@
 # Configuration
 $ServerName = "YourServerName"
 $Database = "YourDatabase"
-$FilePath = "C:\path\to\your\anthemfile.txt"
-$Delimiter = "|"
+$FilePath = "C:\path\to\your\anthemfile.csv"
 $PayorName = "Anthem"
 $TargetTable = "Anthem.MemberShip"
 
@@ -27,30 +26,31 @@ foreach ($line in $MappingLines) {
     }
 }
 
-# Process the file and create SQL statements
+# Check if file exists
 if (Test-Path -Path $FilePath) {
-    $lines = Get-Content -Path $FilePath
+    # Import the CSV file
+    $csvContent = Import-Csv -Path $FilePath -Delimiter ',' -Quote '"' 
+
     $sqlStatements = @()
 
-    foreach ($line in $lines[1..$lines.Length]) {
-        $columns = $line -split $Delimiter
+    # Loop through each row in the CSV
+    foreach ($row in $csvContent) {
         $columnNames = @()
         $values = @()
 
-        # Loop through each column in the file
+        # Loop through each column in the row
         foreach ($IncomingColumnName in $Mappings.Keys) {
             $StandardizedColumnName = $Mappings[$IncomingColumnName]
 
-            # Map incoming data to the standardized column name
-            $columnIndex = [array]::IndexOf($lines[0] -split $Delimiter, $IncomingColumnName)
-            if ($columnIndex -lt $columns.Length -and $columnIndex -ge 0) {
-                $value = $columns[$columnIndex]
+            # Check if the IncomingColumnName exists in the row
+            if ($row.PSObject.Properties[$IncomingColumnName]) {
+                $value = $row.$IncomingColumnName
                 $columnNames += "[$StandardizedColumnName]"
                 $values += "'$value'"
             }
         }
 
-        # Build the SQL INSERT statement for each line
+        # Build the SQL INSERT statement for each row
         $sqlStatement = "INSERT INTO $TargetTable (" + ($columnNames -join ", ") + ") VALUES (" + ($values -join ", ") + ")"
         $sqlStatements += $sqlStatement
     }
