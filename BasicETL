@@ -1,7 +1,8 @@
 # Configuration
 $ServerName = "YourServerName"
 $Database = "YourDatabase"
-$FilePath = "C:\path\to\your\anthemfile.csv"
+$FilePath = "C:\path\to\your\anthemfile.txt"
+$Delimiter = "|"
 $PayorName = "Anthem"
 $TargetTable = "Anthem.MemberShip"
 
@@ -26,56 +27,41 @@ foreach ($line in $MappingLines) {
     }
 }
 
-# Check if file exists
+# Process the file and create SQL statements
 if (Test-Path -Path $FilePath) {
-    $csvContent = Import-Csv -Path $FilePath -Delimiter ','
+    $lines = Get-Content -Path $FilePath
+    $sqlStatements = @()
 
-    # Detect if the CSV file has a single column or multiple columns
-    $isSingleColumn = ($csvContent[0].PSObject.Properties.Count -eq 1)
-    $batchSize = 100
-    $rowBatch = @()
-    $columnNames = ($Mappings.Values -join ", ")
-
-    foreach ($row in $csvContent) {
+    foreach ($line in $lines[1..$lines.Length]) {
+        $columns = $line -split $Delimiter
+        $columnNames = @()
         $values = @()
-        
-        if ($isSingleColumn) {
-            $value = $row.PSObject.Properties[0].Value -replace "'", "''" # Escape single quotes
-            foreach ($TargetColumnName in $Mappings.Values) {
-                $values += "'$value'"
-            }
-        } else {
-            foreach ($IncomingColumnName in $Mappings.Keys) {
-                $value = $row.$IncomingColumnName -replace "'", "''" # Escape single quotes
+
+        # Loop through each column in the file
+        foreach ($IncomingColumnName in $Mappings.Keys) {
+            $StandardizedColumnName = $Mappings[$IncomingColumnName]
+
+            # Map incoming data to the standardized column name
+            $columnIndex = [array]::IndexOf($lines[0] -split $Delimiter, $IncomingColumnName)
+            if ($columnIndex -lt $columns.Length -and $columnIndex -ge 0) {
+                $value = $columns[$columnIndex]
+                $columnNames += "[$StandardizedColumnName]"
                 $values += "'$value'"
             }
         }
 
-        $rowBatch += "(" + ($values -join ", ") + ")"
-
-        if ($rowBatch.Count -ge $batchSize) {
-            $sqlStatement = "INSERT INTO $TargetTable ($columnNames) VALUES " + ($rowBatch -join ", ")
-            Write-Output "Executing SQL: $sqlStatement"  # Diagnostic output
-
-            try {
-                & sqlcmd -S $ServerName -d $Database -Q $sqlStatement
-                Write-Output "Inserted batch of data successfully."
-            } catch {
-                Write-Output "Error inserting data: $_"
-            }
-            $rowBatch.Clear()
-        }
+        # Build the SQL INSERT statement for each line
+        $sqlStatement = "INSERT INTO $TargetTable (" + ($columnNames -join ", ") + ") VALUES (" + ($values -join ", ") + ")"
+        $sqlStatements += $sqlStatement
     }
 
-    if ($rowBatch.Count -gt 0) {
-        $sqlStatement = "INSERT INTO $TargetTable ($columnNames) VALUES " + ($rowBatch -join ", ")
-        Write-Output "Executing Final SQL: $sqlStatement"  # Diagnostic output
-
+    # Execute each SQL statement
+    foreach ($sqlStatement in $sqlStatements) {
         try {
             & sqlcmd -S $ServerName -d $Database -Q $sqlStatement
-            Write-Output "Inserted final batch of data successfully."
+            Write-Output "Inserted data successfully."
         } catch {
-            Write-Output "Error inserting final batch: $_"
+            Write-Output "Error inserting data: $_"
         }
     }
 } else {
