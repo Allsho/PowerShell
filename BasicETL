@@ -4,79 +4,116 @@ $Database = "YourDatabase"
 $FilePath = "C:\path\to\your\anthemfile.csv"
 $PayorName = "Anthem"
 $TargetTable = "Anthem.MemberShip"
+$LogFile = "C:\path\to\logfile.log"
+$BatchSize = 1000  # Number of rows per batch for insertion
 
-# Fetch mappings for the specified PayorName
-$MappingQuery = "SELECT IncomingColumnName, StandardizedColumnName FROM dbo.DataMapping WHERE PayorName = '$PayorName'"
-$MappingResults = & sqlcmd -S $ServerName -d $Database -Q $MappingQuery -W -s"," | Out-String
-$MappingLines = $MappingResults -split "`r?`n" | Where-Object { $_ -match "," }
+# Function to log messages
+function Write-Log {
+    param (
+        [string]$Message,
+        [string]$Level = "INFO"
+    )
+    $Timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+    $LogMessage = "$Timestamp [$Level] $Message"
+    Add-Content -Path $LogFile -Value $LogMessage
+}
 
-if (-not $MappingLines) {
-    Write-Output "Failed to retrieve column mappings for PayorName: $PayorName. Exiting script."
+# Start logging
+Write-Log "Script execution started."
+
+# Fetch column mappings for the specified PayorName
+Write-Log "Fetching column mappings for PayorName: $PayorName."
+$MappingQuery = @"
+SELECT IncomingColumnName, StandardizedColumnName
+FROM dbo.DataMapping
+WHERE PayorName = '$PayorName';
+"@
+
+try {
+    $Mappings = Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $MappingQuery
+    Write-Log "Successfully fetched column mappings."
+} catch {
+    Write-Log "Failed to retrieve column mappings: $_" -Level "ERROR"
     exit
 }
 
-# Parse mappings into a dictionary
-$Mappings = @{}
-foreach ($line in $MappingLines) {
-    $parts = $line -split ","
-    if ($parts.Count -eq 2) {
-        $IncomingColumn = $parts[0].Trim()
-        $StandardizedColumn = $parts[1].Trim()
-        $Mappings[$IncomingColumn] = $StandardizedColumn
-    }
+if ($Mappings.Count -eq 0) {
+    Write-Log "No mappings found for PayorName: $PayorName. Exiting script." -Level "ERROR"
+    exit
 }
 
-# Check if file exists
-if (Test-Path -Path $FilePath) {
-    # Import the CSV file
+# Build mapping dictionary
+$MappingDict = @{}
+foreach ($row in $Mappings) {
+    $MappingDict[$row.IncomingColumnName] = $row.StandardizedColumnName
+}
+
+# Check if the file exists
+if (-not (Test-Path -Path $FilePath)) {
+    Write-Log "File not found: $FilePath" -Level "ERROR"
+    exit
+}
+
+# Load CSV file and prepare for transformation
+Write-Log "Loading CSV file: $FilePath."
+try {
     $csvContent = Import-Csv -Path $FilePath -Delimiter ',' -Quote '"'
-
-    $batchSize = 500  # Define how many rows to include in each batch
-    $batch = @()  # Initialize batch array
-
-    # Loop through each row in the CSV
-    foreach ($row in $csvContent) {
-        $columnNames = @()
-        $values = @()
-
-        # Loop through each column in the row
-        foreach ($IncomingColumnName in $Mappings.Keys) {
-            $StandardizedColumnName = $Mappings[$IncomingColumnName]
-
-            # Check if the IncomingColumnName exists in the row
-            if ($row.PSObject.Properties[$IncomingColumnName]) {
-                $value = $row.$IncomingColumnName
-                $columnNames += "[$StandardizedColumnName]"
-                $values += "'$value'"
-            }
-        }
-
-        # Build a VALUES string for each row and add it to the batch
-        $batch += "(" + ($values -join ", ") + ")"
-
-        # Process batch if it reaches the specified batch size
-        if ($batch.Count -ge $batchSize) {
-            $sqlStatement = "INSERT INTO $TargetTable (" + ($columnNames -join ", ") + ") VALUES " + ($batch -join ", ")
-            try {
-                & sqlcmd -S $ServerName -d $Database -Q $sqlStatement
-                Write-Output "Batch inserted successfully."
-            } catch {
-                Write-Output "Error inserting batch: $_"
-            }
-            $batch.Clear()  # Clear batch for the next set of rows
-        }
-    }
-
-    # Process any remaining rows in the batch
-    if ($batch.Count -gt 0) {
-        $sqlStatement = "INSERT INTO $TargetTable (" + ($columnNames -join ", ") + ") VALUES " + ($batch -join ", ")
-        try {
-            & sqlcmd -S $ServerName -d $Database -Q $sqlStatement
-            Write-Output "Final batch inserted successfully."
-        } catch {
-            Write-Output "Error inserting final batch: $_"
-        }
-    }
-} else {
-    Write-Output "File not found: $FilePath"
+    Write-Log "CSV file loaded successfully."
+} catch {
+    Write-Log "Error loading CSV file: $_" -Level "ERROR"
+    exit
 }
+
+# Transform data and insert in batches
+Write-Log "Transforming data and preparing for insertion."
+$ColumnHeaders = $MappingDict.Values -join ","
+$BatchRows = @()
+$TotalRowsProcessed = 0
+
+foreach ($row in $csvContent) {
+    $Values = @()
+    foreach ($IncomingColumn in $MappingDict.Keys) {
+        if ($row.PSObject.Properties[$IncomingColumn]) {
+            $Value = $row.$IncomingColumn -replace "'", "''"  # Escape single quotes
+            $Values += "'$Value'"
+        } else {
+            $Values += "NULL"
+        }
+    }
+    $BatchRows += "($($Values -join ','))"
+
+    # Insert in batches
+    if ($BatchRows.Count -ge $BatchSize) {
+        $InsertQuery = @"
+INSERT INTO $TargetTable ($ColumnHeaders)
+VALUES
+$($BatchRows -join ",`n");
+"@
+        try {
+            Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $InsertQuery
+            $TotalRowsProcessed += $BatchRows.Count
+            Write-Log "Inserted batch of $BatchSize rows. Total rows processed: $TotalRowsProcessed."
+        } catch {
+            Write-Log "Error inserting batch: $_" -Level "ERROR"
+        }
+        $BatchRows = @()
+    }
+}
+
+# Insert remaining rows
+if ($BatchRows.Count -gt 0) {
+    $InsertQuery = @"
+INSERT INTO $TargetTable ($ColumnHeaders)
+VALUES
+$($BatchRows -join ",`n");
+"@
+    try {
+        Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $InsertQuery
+        $TotalRowsProcessed += $BatchRows.Count
+        Write-Log "Inserted final batch of $BatchRows.Count rows. Total rows processed: $TotalRowsProcessed."
+    } catch {
+        Write-Log "Error inserting final batch: $_" -Level "ERROR"
+    }
+}
+
+Write-Log "Script execution completed. Total rows inserted: $TotalRowsProcessed."
