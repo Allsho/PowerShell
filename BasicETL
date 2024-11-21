@@ -16,21 +16,21 @@ function Write-Log {
     Write-Host "$Timestamp [$Level] $Message"
 }
 
-# Function to execute SQL using ODBC
-function Execute-OdbcQuery {
+# Function to execute a query with sqlcmd
+function Execute-SqlCmd {
     param (
         [string]$Query
     )
-    $ConnectionString = "Driver={ODBC Driver 17 for SQL Server};Server=$ServerName;Database=$Database;Trusted_Connection=Yes;"
-    $Connection = New-Object System.Data.Odbc.OdbcConnection($ConnectionString)
-    $Command = $Connection.CreateCommand()
-    $Command.CommandText = $Query
-    $Connection.Open()
-    $Adapter = New-Object System.Data.Odbc.OdbcDataAdapter $Command
-    $DataSet = New-Object System.Data.DataSet
-    $Adapter.Fill($DataSet)
-    $Connection.Close()
-    return $DataSet.Tables[0]
+    $Command = @"
+sqlcmd -S $ServerName -d $Database -Q "$Query" -h -1 -W
+"@
+    try {
+        $Output = Invoke-Expression -Command $Command
+        return $Output -replace "`r", "" | ForEach-Object { $_.Trim() }
+    } catch {
+        Write-Log "Error executing query: $Command. $_" -Level "ERROR"
+        throw $_
+    }
 }
 
 # Start logging
@@ -44,22 +44,23 @@ FROM dbo.DataMapping
 WHERE PayorName = '$PayorName';
 "@
 try {
-    $Mappings = Execute-OdbcQuery -Query $MappingQuery
+    $Mappings = Execute-SqlCmd -Query $MappingQuery
     Write-Log "Successfully fetched column mappings."
 } catch {
     Write-Log "Failed to retrieve column mappings: $_" -Level "ERROR"
     exit
 }
 
-if ($Mappings.Rows.Count -eq 0) {
+if ($Mappings.Count -eq 0) {
     Write-Log "No mappings found for PayorName: $PayorName. Exiting script." -Level "ERROR"
     exit
 }
 
 # Build mapping dictionary
 $MappingDict = @{}
-foreach ($row in $Mappings.Rows) {
-    $MappingDict[$row["IncomingColumnName"]] = $row["StandardizedColumnName"]
+foreach ($row in $Mappings) {
+    $Columns = $row -split "\t"
+    $MappingDict[$Columns[0]] = $Columns[1]
 }
 
 # Check if the file exists
@@ -78,8 +79,16 @@ try {
     exit
 }
 
-# Transform data and insert in batches
-Write-Log "Transforming data and preparing for insertion."
+# Validate Mapping Against CSV Columns
+$CsvColumns = $csvContent[0].PSObject.Properties.Name
+$MappedColumns = $MappingDict.Keys
+$UnmappedColumns = $CsvColumns | Where-Object { -not $MappedColumns.Contains($_) }
+
+if ($UnmappedColumns.Count -gt 0) {
+    Write-Log "Warning: Unmapped columns found in CSV: $($UnmappedColumns -join ', '). These will be ignored."
+}
+
+# Prepare for data transformation and insertion
 $BatchRows = @()
 $TotalRowsProcessed = 0
 
@@ -93,8 +102,15 @@ foreach ($row in $csvContent) {
             $Values += "NULL"
         }
     }
-    $BatchRows += "($($Values -join ','))"
 
+    # Add only valid rows to the batch
+    if ($Values -join ',' -notmatch "^NULL,") {
+        $BatchRows += "($($Values -join ','))"
+    } else {
+        Write-Log "Skipping empty or invalid row."
+    }
+
+    # Insert in batches
     if ($BatchRows.Count -ge $BatchSize) {
         $InsertQuery = @"
 INSERT INTO $TargetTable ($($MappingDict.Values -join ','))
@@ -102,7 +118,7 @@ VALUES
 $($BatchRows -join ",`n");
 "@
         try {
-            Execute-OdbcQuery -Query $InsertQuery
+            Execute-SqlCmd -Query $InsertQuery
             $TotalRowsProcessed += $BatchRows.Count
             Write-Log "Inserted batch of $BatchSize rows. Total rows processed: $TotalRowsProcessed."
         } catch {
@@ -120,7 +136,7 @@ VALUES
 $($BatchRows -join ",`n");
 "@
     try {
-        Execute-OdbcQuery -Query $InsertQuery
+        Execute-SqlCmd -Query $InsertQuery
         $TotalRowsProcessed += $BatchRows.Count
         Write-Log "Inserted final batch of $BatchRows.Count rows. Total rows processed: $TotalRowsProcessed."
     } catch {
