@@ -1,0 +1,135 @@
+# Configuration
+$ServerName = "YourServerName"
+$Database = "YourDatabase"
+$FilePath = "C:\path\to\your\anthemfile.csv"
+$PayorName = "Anthem"
+$TargetTable = "Anthem.MemberShip"
+$BatchSize = 1000
+
+# Load SQL Client Assembly
+Add-Type -AssemblyName "System.Data"
+
+# Function to log messages
+function Write-Log {
+    param (
+        [string]$Message,
+        [string]$Level = "INFO"
+    )
+    $Timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+    Write-Host "$Timestamp [$Level] $Message"
+}
+
+# Start logging
+Write-Log "Script execution started."
+
+# Function to execute SQL query
+function Execute-SqlQuery {
+    param (
+        [string]$Query
+    )
+    $ConnectionString = "Server=$ServerName;Database=$Database;Integrated Security=True;"
+    $Connection = New-Object System.Data.SqlClient.SqlConnection
+    $Connection.ConnectionString = $ConnectionString
+    $Command = $Connection.CreateCommand()
+    $Command.CommandText = $Query
+    $Connection.Open()
+    $Reader = $Command.ExecuteReader()
+    $Table = New-Object System.Data.DataTable
+    $Table.Load($Reader)
+    $Connection.Close()
+    return $Table
+}
+
+# Fetch column mappings
+Write-Log "Fetching column mappings for PayorName: $PayorName."
+$MappingQuery = @"
+SELECT IncomingColumnName, StandardizedColumnName
+FROM dbo.DataMapping
+WHERE PayorName = '$PayorName';
+"@
+try {
+    $Mappings = Execute-SqlQuery -Query $MappingQuery
+    Write-Log "Successfully fetched column mappings."
+} catch {
+    Write-Log "Failed to retrieve column mappings: $_" -Level "ERROR"
+    exit
+}
+
+if ($Mappings.Rows.Count -eq 0) {
+    Write-Log "No mappings found for PayorName: $PayorName. Exiting script." -Level "ERROR"
+    exit
+}
+
+# Build mapping dictionary
+$MappingDict = @{}
+foreach ($row in $Mappings) {
+    $MappingDict[$row.IncomingColumnName] = $row.StandardizedColumnName
+}
+
+# Check if the file exists
+if (-not (Test-Path -Path $FilePath)) {
+    Write-Log "File not found: $FilePath" -Level "ERROR"
+    exit
+}
+
+# Load CSV file
+Write-Log "Loading CSV file: $FilePath."
+try {
+    $csvContent = Import-Csv -Path $FilePath
+    Write-Log "CSV file loaded successfully."
+} catch {
+    Write-Log "Error loading CSV file: $_" -Level "ERROR"
+    exit
+}
+
+# Prepare and insert data in batches
+Write-Log "Transforming data and preparing for insertion."
+$BatchRows = @()
+$TotalRowsProcessed = 0
+
+foreach ($row in $csvContent) {
+    $Values = @()
+    foreach ($IncomingColumn in $MappingDict.Keys) {
+        if ($row.PSObject.Properties[$IncomingColumn]) {
+            $Value = $row.$IncomingColumn -replace "'", "''"  # Escape single quotes
+            $Values += "'$Value'"
+        } else {
+            $Values += "NULL"
+        }
+    }
+    $BatchRows += "($($Values -join ','))"
+
+    if ($BatchRows.Count -ge $BatchSize) {
+        $InsertQuery = @"
+INSERT INTO $TargetTable ($($MappingDict.Values -join ','))
+VALUES
+$($BatchRows -join ",`n");
+"@
+        try {
+            Execute-SqlQuery -Query $InsertQuery
+            $TotalRowsProcessed += $BatchRows.Count
+            Write-Log "Inserted batch of $BatchSize rows. Total rows processed: $TotalRowsProcessed."
+        } catch {
+            Write-Log "Error inserting batch: $_" -Level "ERROR"
+        }
+        $BatchRows = @()
+    }
+}
+
+# Insert remaining rows
+if ($BatchRows.Count -gt 0) {
+    $InsertQuery = @"
+INSERT INTO $TargetTable ($($MappingDict.Values -join ','))
+VALUES
+$($BatchRows -join ",`n");
+"@
+    try {
+        Execute-SqlQuery -Query $InsertQuery
+        $TotalRowsProcessed += $BatchRows.Count
+        Write-Log "Inserted final batch of $BatchRows.Count rows. Total rows processed: $TotalRowsProcessed."
+    } catch {
+        Write-Log "Error inserting final batch: $_" -Level "ERROR"
+    }
+}
+
+Write-Log "Script execution completed. Total rows inserted: $TotalRowsProcessed."
