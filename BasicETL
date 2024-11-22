@@ -42,7 +42,7 @@ if ($Mappings.Count -eq 0) {
 }
 
 # Build mapping dictionary
-$MappingDict = @{}
+$MappingDict = @{ }
 foreach ($row in $Mappings) {
     $MappingDict[$row.IncomingColumnName] = $row.StandardizedColumnName
 }
@@ -66,7 +66,7 @@ try {
         $ICNColumn = "ICN"
         $DataRows = Get-Content -Path $FilePath | Select-Object -Skip 1
         foreach ($row in $DataRows) {
-            $csvContent += [PSCustomObject]@{ $ICNColumn = $row }
+            $csvContent += [PSCustomObject]@{ $ICNColumn = $row.Trim('"') }
         }
         Log-Message "Detected single-column CSV. Processed $($csvContent.Count) rows."
     } else {
@@ -86,7 +86,7 @@ foreach ($row in $csvContent) {
         # Handle specific mapping conditions
         switch ($MappingDict[$IncomingColumn]) {
             "GETDATE()" {
-                $Values += $MappingDict[$IncomingColumn]  # EffectiveKey
+                $Values += "GETDATE()"  # EffectiveKey
             }
             "<SourceFileName>" {
                 $Values += "'$($SourceFileName -replace "'", "''")'"  # SourceFileName
@@ -116,8 +116,10 @@ $ColumnHeaders = $MappingDict.Values -join ","  # Include all mapped columns
 $InsertQuery = @"
 INSERT INTO $TargetTable ($ColumnHeaders)
 VALUES
-$($TransformedRows -join ",n");
+$($TransformedRows -join ",`n");
 "@
+
+Write-Host $InsertQuery  # Debugging: Print query for validation
 
 # Section 5: Insert Data into the Database
 try {
@@ -125,6 +127,7 @@ try {
     Log-Message "Data inserted successfully into $TargetTable."
 } catch {
     Log-Message "Error inserting data: $_"
+    Write-Host "Detailed Error: $($_.Exception.Message)"
 }
 
 # Finalize Logging
