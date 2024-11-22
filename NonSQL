@@ -1,132 +1,158 @@
+# ==========================================
+# ETL Template Script for CSV to SQL Server
+# ==========================================
+
 # Configuration
 $ServerName = "YourServerName"
 $Database = "YourDatabase"
 $FilePath = "C:\path\to\your\anthemfile.csv"
 $PayorName = "Anthem"
 $TargetTable = "Anthem.MemberShip"
-$BatchSize = 1000
+$LogFile = "C:\path\to\your\etl_log.txt"
+$BatchSize = 1000  # Maximum rows per insert statement
 
-# Function to log messages
-function Write-Log {
+# Extract just the file name from the full file path
+$SourceFileName = Split-Path -Path $FilePath -Leaf
+
+# Function: Log a message to the log file
+function Log-Message {
     param (
-        [string]$Message,
-        [string]$Level = "INFO"
+        [string]$Message
     )
-    $Timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-    Write-Host "$Timestamp [$Level] $Message"
+    $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    Add-Content -Path $LogFile -Value "$Timestamp - $Message"
 }
 
-# Function to execute a query with sqlcmd
-function Execute-SqlCmd {
-    param (
-        [string]$Query
-    )
-    $Command = @"
-sqlcmd -S $ServerName -d $Database -Q "$Query" -h -1 -W
-"@
-    try {
-        $Output = Invoke-Expression -Command $Command
-        return $Output -replace "`r", "" | ForEach-Object { $_.Trim() }
-    } catch {
-        Write-Log "Error executing query: $Command. $_" -Level "ERROR"
-        throw $_
-    }
-}
+# Start ETL process logging
+Log-Message "ETL process started for PayorName: $PayorName."
 
-# Start logging
-Write-Log "Script execution started."
-
-# Fetch column mappings
-Write-Log "Fetching column mappings for PayorName: $PayorName."
+# -----------------------------------------
+# Section 1: Fetch Column Mappings (Extract)
+# -----------------------------------------
 $MappingQuery = @"
 SELECT IncomingColumnName, StandardizedColumnName
-FROM dbo.DataMapping
+FROM dbo.Claim_Data_Mapping
 WHERE PayorName = '$PayorName';
 "@
+
 try {
-    $Mappings = Execute-SqlCmd -Query $MappingQuery
-    Write-Log "Successfully fetched column mappings."
+    $Mappings = Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $MappingQuery
+    Log-Message "Fetched column mappings successfully."
 } catch {
-    Write-Log "Failed to retrieve column mappings: $_" -Level "ERROR"
+    Log-Message "Failed to retrieve column mappings: $_"
     exit
 }
 
 if ($Mappings.Count -eq 0) {
-    Write-Log "No mappings found for PayorName: $PayorName. Exiting script." -Level "ERROR"
+    Log-Message "No mappings found for PayorName: $PayorName. Exiting script."
     exit
 }
 
 # Build mapping dictionary
-$MappingDict = @{}
+$MappingDict = @{ }
 foreach ($row in $Mappings) {
-    $Columns = $row -split "\t"
-    $MappingDict[$Columns[0]] = $Columns[1]
+    $MappingDict[$row.IncomingColumnName] = $row.StandardizedColumnName
 }
+Log-Message "Mapping dictionary created with keys: $($MappingDict.Keys -join ', ')."
 
-# Check if the file exists
+# -----------------------------------------
+# Section 2: Verify File Exists
+# -----------------------------------------
 if (-not (Test-Path -Path $FilePath)) {
-    Write-Log "File not found: $FilePath" -Level "ERROR"
+    Log-Message "File not found: $FilePath"
     exit
 }
 
-# Load CSV file
-Write-Log "Loading CSV file: $FilePath."
+# -----------------------------------------
+# Section 3: Load and Transform Data (Transform)
+# -----------------------------------------
 try {
-    $csvContent = Import-Csv -Path $FilePath
-    Write-Log "CSV file loaded successfully."
+    # Detect if the file is a single-column CSV
+    $FirstLine = Get-Content -Path $FilePath -First 1
+    $IsSingleColumn = ($FirstLine -notmatch ",") -and ($FirstLine -match "\S")
+
+    if ($IsSingleColumn) {
+        # Transform single-column data into a structured format
+        $csvContent = @()
+        $ICNColumn = "ICN"
+        $DataRows = Get-Content -Path $FilePath | Select-Object -Skip 1
+        foreach ($row in $DataRows) {
+            $csvContent += [PSCustomObject]@{ $ICNColumn = $row }
+        }
+        Log-Message "Detected single-column CSV. Processed $($csvContent.Count) rows."
+    } else {
+        # Process as a standard CSV
+        $csvContent = Import-Csv -Path $FilePath -Delimiter ',' -Quote '"'
+        Log-Message "Loaded standard CSV file successfully with $($csvContent.Count) rows."
+    }
 } catch {
-    Write-Log "Error loading CSV file: $_" -Level "ERROR"
+    Log-Message "Failed to load CSV file: $_"
     exit
 }
 
-# Transform data and insert in batches
-Write-Log "Transforming data and preparing for insertion."
-$BatchRows = @()
-$TotalRowsProcessed = 0
-
+# Transform rows into SQL-compatible values
+$TransformedRows = @()
 foreach ($row in $csvContent) {
     $Values = @()
     foreach ($IncomingColumn in $MappingDict.Keys) {
-        if ($row.PSObject.Properties[$IncomingColumn]) {
-            $Value = $row.$IncomingColumn -replace "'", "''"  # Escape single quotes
-            $Values += "'$Value'"
-        } else {
-            $Values += "NULL"
+        switch ($MappingDict[$IncomingColumn]) {
+            "EffectiveKey" {
+                $Values += "GETDATE()"  # EffectiveKey
+            }
+            "SourceFileName" {
+                $Values += "'$($SourceFileName -replace "'", "''")'"  # SourceFileName
+            }
+            default {
+                if ($row.PSObject.Properties[$IncomingColumn]) {
+                    # Map normal columns
+                    $Value = $row.$IncomingColumn -replace "'", "''"  # Escape single quotes
+                    $Values += "'$Value'"
+                } else {
+                    # Handle missing values as NULL
+                    $Values += "NULL"
+                }
+            }
         }
     }
-    $BatchRows += "($($Values -join ','))"
-
-    if ($BatchRows.Count -ge $BatchSize) {
-        $InsertQuery = @"
-INSERT INTO $TargetTable ($($MappingDict.Values -join ','))
-VALUES
-$($BatchRows -join ",`n");
-"@
-        try {
-            Execute-SqlCmd -Query $InsertQuery
-            $TotalRowsProcessed += $BatchRows.Count
-            Write-Log "Inserted batch of $BatchSize rows. Total rows processed: $TotalRowsProcessed."
-        } catch {
-            Write-Log "Error inserting batch: $_" -Level "ERROR"
-        }
-        $BatchRows = @()
-    }
+    $TransformedRows += "($($Values -join ','))"
 }
 
-# Insert remaining rows
-if ($BatchRows.Count -gt 0) {
-    $InsertQuery = @"
-INSERT INTO $TargetTable ($($MappingDict.Values -join ','))
-VALUES
-$($BatchRows -join ",`n");
-"@
+if ($TransformedRows.Count -eq 0) {
+    Log-Message "No data to insert. Exiting script."
+    exit
+}
+
+# -----------------------------------------
+# Section 4: Batch Insert Query (Load)
+# -----------------------------------------
+$ColumnHeaders = $MappingDict.Values -join ","  # Include all mapped columns
+$TotalRows = $TransformedRows.Count
+$InsertedRows = 0
+
+while ($InsertedRows -lt $TotalRows) {
+    # Get the next batch
+    $Batch = $TransformedRows[$InsertedRows..([Math]::Min($InsertedRows + $BatchSize - 1, $TotalRows - 1))]
+    
+    # Create the INSERT query for the current batch
+    $BatchInsertQuery = @"
+    INSERT INTO $TargetTable ($ColumnHeaders)
+    VALUES
+    $($Batch -join ",`n");
+    "@
+
     try {
-        Execute-SqlCmd -Query $InsertQuery
-        $TotalRowsProcessed += $BatchRows.Count
-        Write-Log "Inserted final batch of $BatchRows.Count rows. Total rows processed: $TotalRowsProcessed."
+        # Execute the batch insert
+        Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $BatchInsertQuery
+        Log-Message "Inserted batch of $($Batch.Count) rows successfully."
     } catch {
-        Write-Log "Error inserting final batch: $_" -Level "ERROR"
+        Log-Message "Error inserting batch: $_"
     }
+
+    # Update the count of inserted rows
+    $InsertedRows += $Batch.Count
 }
 
-Write-Log "Script execution completed. Total rows inserted: $TotalRowsProcessed."
+# -----------------------------------------
+# Finalize Logging
+# -----------------------------------------
+Log-Message "ETL process completed for PayorName: $PayorName."
