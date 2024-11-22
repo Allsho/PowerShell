@@ -4,144 +4,106 @@ $Database = "YourDatabase"
 $FilePath = "C:\path\to\your\anthemfile.csv"
 $PayorName = "Anthem"
 $TargetTable = "Anthem.MemberShip"
-$BatchSize = 1000
+$LogFile = "C:\path\to\your\etl_log.txt"
 
-# Function to log messages
-function Write-Log {
-    param (
-        [string]$Message,
-        [string]$Level = "INFO"
-    )
-    $Timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-    Write-Host "$Timestamp [$Level] $Message"
-}
+# Extract just the file name from the full file path
+$SourceFileName = Split-Path -Path $FilePath -Leaf
 
-# Function to execute a query with sqlcmd
-function Execute-SqlCmd {
+# Log a message to the file
+function Log-Message {
     param (
-        [string]$Query
+        [string]$Message
     )
-    $Command = @"
-sqlcmd -S $ServerName -d $Database -Q "$Query" -h -1 -W
-"@
-    try {
-        $Output = Invoke-Expression -Command $Command
-        return $Output -replace "`r", "" | ForEach-Object { $_.Trim() }
-    } catch {
-        Write-Log "Error executing query: $Command. $_" -Level "ERROR"
-        throw $_
-    }
+    $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    Add-Content -Path $LogFile -Value "$Timestamp - $Message"
 }
 
 # Start logging
-Write-Log "Script execution started."
+Log-Message "ETL process started for PayorName: $PayorName."
 
-# Fetch column mappings
-Write-Log "Fetching column mappings for PayorName: $PayorName."
+# Fetch mappings for the specified PayorName using Invoke-SqlCmd
 $MappingQuery = @"
 SELECT IncomingColumnName, StandardizedColumnName
 FROM dbo.DataMapping
 WHERE PayorName = '$PayorName';
 "@
+
 try {
-    $Mappings = Execute-SqlCmd -Query $MappingQuery
-    Write-Log "Successfully fetched column mappings."
+    $Mappings = Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $MappingQuery
+    Log-Message "Fetched column mappings successfully."
 } catch {
-    Write-Log "Failed to retrieve column mappings: $_" -Level "ERROR"
+    Log-Message "Failed to retrieve column mappings: $_"
     exit
 }
 
 if ($Mappings.Count -eq 0) {
-    Write-Log "No mappings found for PayorName: $PayorName. Exiting script." -Level "ERROR"
+    Log-Message "No mappings found for PayorName: $PayorName. Exiting script."
     exit
 }
 
 # Build mapping dictionary
 $MappingDict = @{}
 foreach ($row in $Mappings) {
-    $Columns = $row -split "\t"
-    $MappingDict[$Columns[0]] = $Columns[1]
+    $MappingDict[$row.IncomingColumnName] = $row.StandardizedColumnName
 }
+Log-Message "Mapping dictionary created with keys: $($MappingDict.Keys -join ', ')."
 
-# Check if the file exists
+# Check if file exists
 if (-not (Test-Path -Path $FilePath)) {
-    Write-Log "File not found: $FilePath" -Level "ERROR"
+    Log-Message "File not found: $FilePath"
     exit
 }
 
-# Load CSV file
-Write-Log "Loading CSV file: $FilePath."
+# Load CSV file and transform data
 try {
-    $csvContent = Import-Csv -Path $FilePath
-    Write-Log "CSV file loaded successfully."
+    $csvContent = Import-Csv -Path $FilePath -Delimiter ',' -Quote '"'
+    Log-Message "Loaded CSV file successfully with $($csvContent.Count) rows."
 } catch {
-    Write-Log "Error loading CSV file: $_" -Level "ERROR"
+    Log-Message "Failed to load CSV file: $_"
     exit
 }
 
-# Validate Mapping Against CSV Columns
-$CsvColumns = $csvContent[0].PSObject.Properties.Name
-$MappedColumns = $MappingDict.Keys
-$UnmappedColumns = $CsvColumns | Where-Object { -not $MappedColumns.Contains($_) }
-
-if ($UnmappedColumns.Count -gt 0) {
-    Write-Log "Warning: Unmapped columns found in CSV: $($UnmappedColumns -join ', '). These will be ignored."
-}
-
-# Prepare for data transformation and insertion
-$BatchRows = @()
-$TotalRowsProcessed = 0
+$TransformedRows = @()
 
 foreach ($row in $csvContent) {
     $Values = @()
     foreach ($IncomingColumn in $MappingDict.Keys) {
-        if ($row.PSObject.Properties[$IncomingColumn]) {
+        if ($MappingDict[$IncomingColumn] -eq "GETDATE()") {
+            # Handle EffectiveKey
+            $Values += $MappingDict[$IncomingColumn]
+        } elseif ($MappingDict[$IncomingColumn] -eq "<SourceFileName>") {
+            # Handle SourceFileName
+            $Values += "'$($SourceFileName -replace "'", "''")'"
+        } elseif ($row.PSObject.Properties[$IncomingColumn]) {
+            # Map normal columns
             $Value = $row.$IncomingColumn -replace "'", "''"  # Escape single quotes
             $Values += "'$Value'"
         } else {
+            # Handle missing values as NULL
             $Values += "NULL"
         }
     }
-
-    # Add only valid rows to the batch
-    if ($Values -join ',' -notmatch "^NULL,") {
-        $BatchRows += "($($Values -join ','))"
-    } else {
-        Write-Log "Skipping empty or invalid row."
-    }
-
-    # Insert in batches
-    if ($BatchRows.Count -ge $BatchSize) {
-        $InsertQuery = @"
-INSERT INTO $TargetTable ($($MappingDict.Values -join ','))
-VALUES
-$($BatchRows -join ",`n");
-"@
-        try {
-            Execute-SqlCmd -Query $InsertQuery
-            $TotalRowsProcessed += $BatchRows.Count
-            Write-Log "Inserted batch of $BatchSize rows. Total rows processed: $TotalRowsProcessed."
-        } catch {
-            Write-Log "Error inserting batch: $_" -Level "ERROR"
-        }
-        $BatchRows = @()
-    }
+    $TransformedRows += "($($Values -join ','))"
 }
 
-# Insert remaining rows
-if ($BatchRows.Count -gt 0) {
-    $InsertQuery = @"
-INSERT INTO $TargetTable ($($MappingDict.Values -join ','))
-VALUES
-$($BatchRows -join ",`n");
-"@
-    try {
-        Execute-SqlCmd -Query $InsertQuery
-        $TotalRowsProcessed += $BatchRows.Count
-        Write-Log "Inserted final batch of $BatchRows.Count rows. Total rows processed: $TotalRowsProcessed."
-    } catch {
-        Write-Log "Error inserting final batch: $_" -Level "ERROR"
-    }
+if ($TransformedRows.Count -eq 0) {
+    Log-Message "No data to insert. Exiting script."
+    exit
 }
 
-Write-Log "Script execution completed. Total rows inserted: $TotalRowsProcessed."
+# Build bulk insert query dynamically
+$ColumnHeaders = $MappingDict.Values -join ","  # Include all mapped columns
+$InsertQuery = @"
+INSERT INTO $TargetTable ($ColumnHeaders)
+VALUES
+$($TransformedRows -join ",`n");
+"@
+
+# Insert data into the database
+try {
+    Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $InsertQuery
+    Log-Message "Data inserted successfully into $TargetTable."
+} catch {
+    Log-Message "Error inserting data: $_"
+}
+Log-Message "ETL process completed for PayorName: $PayorName."
