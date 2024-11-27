@@ -1,14 +1,14 @@
 # ==========================================
-# Enhanced ETL Template Script for CSV to SQL Server
+# Enhanced ETL Script for CSV to SQL Server
 # ==========================================
 
 # Configuration
-$ServerName = ""                              # SQL Server name or IP address
-$Database = "ClaimsStage"                     # Database to store the data
-$FolderPath = ""                              # Directory containing CSV files to process
-$DataMappingTable = "ETL.Claim_Data_Mapping"  # Table containing column mappings
-$TableMappingTable = "ETL.Table_Mapping"      # Table mapping FilePattern to TargetTable
-$BatchSize = 1000                             # Maximum number of rows to insert per query
+$ServerName = ""  # SQL Server name or IP address
+$Database = "ClaimsStage"  # Database to store the data
+$FolderPath = ""  # Directory containing CSV files to process
+$DataMappingTable = "ETL.Claim_Data_Mapping"  # Table for column mappings
+$TableMappingTable = "ETL.Table_Mapping"  # Table mapping FilePattern to TargetTable
+$BatchSize = 1000  # Maximum number of rows to insert per query
 
 # Function: Log a message to the database
 function Log_Message {
@@ -85,9 +85,9 @@ foreach ($File in $Files) {
     }
 
     # Create mapping dictionary
-    $MappingDict = @{}
-    foreach ($Row in $Mappings) {
-        $MappingDict[$Row.IncomingColumnName] = $Row.StandardizedColumnName
+    $MappingDict = @{ }
+    foreach ($row in $Mappings) {
+        $MappingDict[$row.IncomingColumnName] = $row.StandardizedColumnName
     }
 
     # Verify file exists
@@ -98,12 +98,12 @@ foreach ($File in $Files) {
 
     # Load CSV content
     try {
-        $CsvContent = Import-Csv -Path $FilePath -Delimiter ',' -Quote '"'
-        if ($CsvContent.Count -eq 0) {
+        $csvContent = Import-Csv -Path $FilePath -Delimiter ',' -Quote '"'
+        if ($csvContent.Count -eq 0) {
             Log_Message "No data in file: $FilePath"
             continue
         }
-        Log_Message "Loaded file: $SourceFileName successfully with $($CsvContent.Count) rows."
+        Log_Message "Loaded file: $SourceFileName successfully with $($csvContent.Count) rows."
     } catch {
         Log_Message "Failed to load CSV file: $SourceFileName : $_"
         continue
@@ -111,26 +111,14 @@ foreach ($File in $Files) {
 
     # Transform rows into SQL-compatible values
     $TransformedRows = @()
-    foreach ($Row in $CsvContent) {
+    foreach ($row in $csvContent) {
         $Values = @()
         foreach ($IncomingColumn in $MappingDict.Keys) {
-            $MappedColumn = $MappingDict[$IncomingColumn]
-            switch ($MappedColumn) {
-                "EffectiveKey" {
-                    $Parts = $SourceFileName -split '_'
-                    $Values += $Parts[2].Substring(0, 6)
-                }
-                "SourceFileName" {
-                    $Values += "'$($SourceFileName -replace "'", "''")'"
-                }
-                default {
-                    $Value = $Row.$IncomingColumn -replace "'", "''"
-                    if ($Value -ne "") {
-                        $Values += "'$Value'"
-                    } else {
-                        $Values += "NULL"
-                    }
-                }
+            if ($row.$IncomingColumn -ne $null) {
+                $EscapedValue = $row.$IncomingColumn -replace "'", "''"
+                $Values += "'$EscapedValue'"
+            } else {
+                $Values += "NULL"
             }
         }
         $TransformedRows += "($($Values -join ','))"
@@ -142,7 +130,7 @@ foreach ($File in $Files) {
     }
 
     # Insert in batches
-    $ColumnHeaders = $MappingDict.Values -join ","
+    $ColumnHeaders = $MappingDict.Values | ForEach-Object { "[$_]" } -join ","
     $TotalRows = $TransformedRows.Count
     $InsertedRows = 0
 
