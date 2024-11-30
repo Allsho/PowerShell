@@ -85,7 +85,7 @@ foreach ($File in $Files) {
     }
 
     # Create mapping dictionary
-    $MappingDict = @{}
+    $MappingDict = @{ }
     foreach ($Row in $Mappings) {
         $MappingDict[$Row.IncomingColumnName] = $Row.StandardizedColumnName
     }
@@ -96,7 +96,7 @@ foreach ($File in $Files) {
         continue
     }
 
-    # Load CSV content
+    # Load and transform CSV content
     try {
         $CsvContent = Import-Csv -Path $FilePath -Delimiter ',' # -Quote '"'
         if ($CsvContent.Count -eq 0) {
@@ -109,8 +109,11 @@ foreach ($File in $Files) {
         continue
     }
 
-    # Transform rows into SQL-compatible values
-    $TransformedRows = @()
+    # Prepare headers for insertion
+    $ColumnHeaders = ($MappingDict.Values | ForEach-Object { "[$_]" }) -join ","
+    $RowCounter = 0
+    $BatchRows = @()
+
     foreach ($Row in $CsvContent) {
         $Values = @()
         foreach ($IncomingColumn in $MappingDict.Keys) {
@@ -133,33 +136,26 @@ foreach ($File in $Files) {
                 }
             }
         }
-        $TransformedRows += "($($Values -join ','))"
-    }
+        $BatchRows += "($($Values -join ','))"
+        $RowCounter++
 
-    if ($TransformedRows.Count -eq 0) {
-        Log_Message "No rows to insert for file: $SourceFileName."
-        continue
-    }
-
-    # Insert in batches
-    $ColumnHeaders = ($MappingDict.Values | ForEach-Object { "[$_]" }) -join ","
-    $TotalRows = $TransformedRows.Count
-    $InsertedRows = 0
-
-    while ($InsertedRows -lt $TotalRows) {
-        $Batch = $TransformedRows[$InsertedRows..([Math]::Min($InsertedRows + $BatchSize - 1, $TotalRows - 1))]
-        $BatchInsertQuery = @"
-        INSERT INTO $TargetTable ($ColumnHeaders)
-        VALUES
-        $($Batch -join ",`n");
+        # Process batch when size is reached or at the end
+        if ($RowCounter % $BatchSize -eq 0 -or $RowCounter -eq $CsvContent.Count) {
+            $BatchInsertQuery = @"
+            INSERT INTO $TargetTable ($ColumnHeaders)
+            VALUES
+            $($BatchRows -join ",`n");
 "@
-        try {
-            Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $BatchInsertQuery -TrustServerCertificate
-            Log_Message "Inserted batch of $($Batch.Count) rows for file: $SourceFileName."
-        } catch {
-            Log_Message "Failed to insert batch for file: $SourceFileName : $_"
+            try {
+                Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $BatchInsertQuery -TrustServerCertificate
+                Log_Message "Inserted batch of $($BatchRows.Count) rows for file: $SourceFileName."
+            } catch {
+                Log_Message "Failed to insert batch for file: $SourceFileName : $_"
+            }
+
+            # Clear batch memory
+            $BatchRows.Clear()
         }
-        $InsertedRows += $Batch.Count
     }
 }
 
