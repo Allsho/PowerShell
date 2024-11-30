@@ -1,5 +1,5 @@
 # ==========================================
-# Enhanced ETL Template Script with Mapping and BCP
+# Enhanced ETL Template Script for CSV to SQL Server
 # ==========================================
 
 # Configuration
@@ -8,13 +8,7 @@ $Database = "ClaimsStage"                     # Database to store the data
 $FolderPath = ""                              # Directory containing CSV files to process
 $DataMappingTable = "ETL.Claim_Data_Mapping"  # Table containing column mappings
 $TableMappingTable = "ETL.Table_Mapping"      # Table mapping FilePattern to TargetTable
-$MappedFilePath = "$FolderPath\MappedFiles"   # Directory to store transformed files
-$BCPPath = "C:\Program Files\Microsoft SQL Server\Client SDK\ODBC\170\Tools\Binn\bcp.exe"  # Path to bcp utility
-
-# Create the MappedFiles directory if not exists
-if (-not (Test-Path -Path $MappedFilePath)) {
-    New-Item -ItemType Directory -Path $MappedFilePath | Out-Null
-}
+$BatchSize = 1000                             # Maximum number of rows to insert per query
 
 # Function: Log a message to the database
 function Log_Message {
@@ -28,21 +22,6 @@ function Log_Message {
         Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $LogQuery -TrustServerCertificate
     } catch {
         Write-Host "Failed to log message to database: $_"
-    }
-}
-
-# Function: Execute BCP command
-function Execute_BCP {
-    param (
-        [string]$BCPCommand
-    )
-    try {
-        & $BCPCommand
-        if ($LASTEXITCODE -ne 0) {
-            throw "BCP command failed with exit code $LASTEXITCODE"
-        }
-    } catch {
-        throw "Error executing BCP command: $_"
     }
 }
 
@@ -77,6 +56,16 @@ foreach ($File in $Files) {
         continue
     }
 
+    # Truncate target table
+    $TruncateQuery = "TRUNCATE TABLE $TargetTable;"
+    try {
+        Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $TruncateQuery -TrustServerCertificate
+        Log_Message "Staging table $TargetTable truncated successfully."
+    } catch {
+        Log_Message "Failed to truncate table $TargetTable : $_"
+        continue
+    }
+
     # Fetch column mappings
     $MappingQuery = @"
     SELECT IncomingColumnName, StandardizedColumnName
@@ -96,55 +85,81 @@ foreach ($File in $Files) {
     }
 
     # Create mapping dictionary
-    $MappingDict = @{ }
+    $MappingDict = @{}
     foreach ($Row in $Mappings) {
         $MappingDict[$Row.IncomingColumnName] = $Row.StandardizedColumnName
     }
 
-    # Transform CSV content
-    $MappedFile = "$MappedFilePath\$SourceFileName"
+    # Verify file exists
+    if (-not (Test-Path -Path $FilePath)) {
+        Log_Message "File not found: $FilePath"
+        continue
+    }
+
+    # Load CSV content
     try {
         $CsvContent = Import-Csv -Path $FilePath -Delimiter ',' # -Quote '"'
         if ($CsvContent.Count -eq 0) {
             Log_Message "No data in file: $FilePath"
             continue
         }
-        # Map and transform rows
-        $TransformedRows = foreach ($Row in $CsvContent) {
-            $MappedRow = @{}
-            foreach ($IncomingColumn in $MappingDict.Keys) {
-                $MappedColumn = $MappingDict[$IncomingColumn]
-                switch ($MappedColumn) {
-                    "EffectiveKey" {
-                        $Parts = $SourceFileName -split '_'
-                        $MappedRow[$MappedColumn] = $Parts[2].Substring(0, 6)
-                    }
-                    "SourceFileName" {
-                        $MappedRow[$MappedColumn] = $SourceFileName
-                    }
-                    default {
-                        $MappedRow[$MappedColumn] = $Row.$IncomingColumn
-                    }
-                }
-            }
-            New-Object PSObject -Property $MappedRow
-        }
-        # Export transformed rows to a new file
-        $TransformedRows | Export-Csv -Path $MappedFile -NoTypeInformation
-        Log_Message "Transformed file saved: $MappedFile"
+        Log_Message "Loaded file: $SourceFileName successfully with $($CsvContent.Count) rows."
     } catch {
-        Log_Message "Failed to transform file: $SourceFileName : $_"
+        Log_Message "Failed to load CSV file: $SourceFileName : $_"
         continue
     }
 
-    # Bulk Insert Transformed File with BCP
-    try {
-        $BCPCommand = "$BCPPath $Database.$TargetTable in $MappedFile -c -t, -S $ServerName -T"
-        Execute_BCP -BCPCommand $BCPCommand
-        Log_Message "BCP load completed for file: $SourceFileName into $TargetTable"
-    } catch {
-        Log_Message "BCP load failed for file: $SourceFileName : $_"
+    # Transform rows into SQL-compatible values
+    $TransformedRows = @()
+    foreach ($Row in $CsvContent) {
+        $Values = @()
+        foreach ($IncomingColumn in $MappingDict.Keys) {
+            $MappedColumn = $MappingDict[$IncomingColumn]
+            switch ($MappedColumn) {
+                "EffectiveKey" {
+                    $Parts = $SourceFileName -split '_'
+                    $Values += $Parts[2].Substring(0, 6)
+                }
+                "SourceFileName" {
+                    $Values += "'$($SourceFileName -replace "'", "''")'"
+                }
+                default {
+                    $Value = $Row.$IncomingColumn -replace "'", "''"
+                    if ($Value -ne "") {
+                        $Values += "'$Value'"
+                    } else {
+                        $Values += "NULL"
+                    }
+                }
+            }
+        }
+        $TransformedRows += "($($Values -join ','))"
+    }
+
+    if ($TransformedRows.Count -eq 0) {
+        Log_Message "No rows to insert for file: $SourceFileName."
         continue
+    }
+
+    # Insert in batches
+    $ColumnHeaders = ($MappingDict.Values | ForEach-Object { "[$_]" }) -join ","
+    $TotalRows = $TransformedRows.Count
+    $InsertedRows = 0
+
+    while ($InsertedRows -lt $TotalRows) {
+        $Batch = $TransformedRows[$InsertedRows..([Math]::Min($InsertedRows + $BatchSize - 1, $TotalRows - 1))]
+        $BatchInsertQuery = @"
+        INSERT INTO $TargetTable ($ColumnHeaders)
+        VALUES
+        $($Batch -join ",`n");
+"@
+        try {
+            Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $BatchInsertQuery -TrustServerCertificate
+            Log_Message "Inserted batch of $($Batch.Count) rows for file: $SourceFileName."
+        } catch {
+            Log_Message "Failed to insert batch for file: $SourceFileName : $_"
+        }
+        $InsertedRows += $Batch.Count
     }
 }
 
