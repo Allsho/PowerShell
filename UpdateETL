@@ -1,5 +1,6 @@
 # ==========================================
 # Enhanced ETL Template Script for CSV to SQL Server
+# Optimized for Performance
 # ==========================================
 
 # Configuration
@@ -104,44 +105,43 @@ foreach ($File in $Files) {
             continue
         }
         Log_Message "Loaded file: $SourceFileName successfully with $($CsvContent.Count) rows."
-    } catch {
-        Log_Message "Failed to load CSV file: $SourceFileName : $_"
-        continue
-    }
 
-    # Prepare headers for insertion
-    $ColumnHeaders = ($MappingDict.Values | ForEach-Object { "[$_]" }) -join ","
-    $RowCounter = 0
-    $BatchRows = @()
-
-    foreach ($Row in $CsvContent) {
-        $Values = @()
-        foreach ($IncomingColumn in $MappingDict.Keys) {
-            $MappedColumn = $MappingDict[$IncomingColumn]
-            switch ($MappedColumn) {
-                "EffectiveKey" {
-                    $Parts = $SourceFileName -split '_'
-                    $Values += $Parts[2].Substring(0, 6)
-                }
-                "SourceFileName" {
-                    $Values += "'$($SourceFileName -replace "'", "''")'"
-                }
-                default {
-                    $Value = $Row.$IncomingColumn -replace "'", "''"
-                    if ($Value -ne "") {
-                        $Values += "'$Value'"
-                    } else {
-                        $Values += "NULL"
+        # Preprocess and transform rows
+        $TransformedRows = $CsvContent | ForEach-Object {
+            $Values = @()
+            foreach ($IncomingColumn in $MappingDict.Keys) {
+                $MappedColumn = $MappingDict[$IncomingColumn]
+                switch ($MappedColumn) {
+                    "EffectiveKey" {
+                        $Parts = $SourceFileName -split '_'
+                        $Values += "'$($Parts[2].Substring(0, 6))'"
+                    }
+                    "SourceFileName" {
+                        $Values += "'$($SourceFileName -replace "'", "''")'"
+                    }
+                    default {
+                        $Value = $_.$IncomingColumn -replace "'", "''"
+                        if ($Value -ne "") {
+                            $Values += "'$Value'"
+                        } else {
+                            $Values += "NULL"
+                        }
                     }
                 }
             }
+            "($($Values -join ','))"
         }
-        $BatchRows += "($($Values -join ','))"
-        $RowCounter++
-    
-        # Process batch when size is reached or at the end
-        if ($RowCounter % $BatchSize -eq 0 -or $RowCounter -eq $CsvContent.Count) {
-            if ($BatchRows.Count -gt 0) {  # Ensure there are rows to insert
+
+        # Insert transformed data in batches
+        $ColumnHeaders = ($MappingDict.Values | ForEach-Object { "[$_]" }) -join ","
+        $BatchRows = @()
+        $RowCounter = 0
+
+        foreach ($Row in $TransformedRows) {
+            $BatchRows.Add($Row)
+            $RowCounter++
+
+            if ($RowCounter % $BatchSize -eq 0 -or $RowCounter -eq $TransformedRows.Count) {
                 $BatchInsertQuery = @"
                 INSERT INTO $TargetTable ($ColumnHeaders)
                 VALUES
@@ -154,10 +154,12 @@ foreach ($File in $Files) {
                 } catch {
                     Log_Message "Failed to insert batch for file: $SourceFileName : $_"
                 }
+                $BatchRows.Clear()
             }
-            # Clear batch memory properly
-            $BatchRows = @()
         }
+    } catch {
+        Log_Message "Failed to load or transform CSV file: $SourceFileName : $_"
+        continue
     }
 }
 
