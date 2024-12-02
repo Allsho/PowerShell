@@ -98,7 +98,7 @@ foreach ($File in $Files) {
 
     # Load and transform CSV content
     try {
-        $CsvContent = Import-Csv -Path $FilePath -Delimiter ',' # -Quote '"'
+        $CsvContent = Import-Csv -Path $FilePath -Delimiter ',' #-Quote '"'
         if ($CsvContent.Count -eq 0) {
             Log_Message "No data in file: $FilePath"
             continue
@@ -146,6 +146,7 @@ foreach ($File in $Files) {
             VALUES
             $($BatchRows -join ",`n");
 "@
+            Write-Host "Executing Batch Insert Query: $BatchInsertQuery" # Debugging
             try {
                 Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $BatchInsertQuery -TrustServerCertificate
                 Log_Message "Inserted batch of $($BatchRows.Count) rows for file: $SourceFileName."
