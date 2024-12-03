@@ -112,6 +112,10 @@ foreach ($File in $Files) {
             foreach ($IncomingColumn in $MappingDict.Keys) {
                 $MappedColumn = $MappingDict[$IncomingColumn]
                 switch ($MappedColumn) {
+                    "EffectiveKey" {
+                        $Parts = $SourceFileName -split '_'
+                        $Values += "'$($Parts[2].Substring(0, 6))'"
+                    }
                     "SourceFileName" {
                         $Values += "'$($SourceFileName -replace "'", "''")'"
                     }
