@@ -7,7 +7,7 @@ $ServerName = ""                              # SQL Server name or IP address
 $Database = "ClaimsStage"                     # Database to store the data
 $FolderPath = ""                              # Directory containing files to process
 $DataMappingTable = "ETL.Claim_Data_Mapping"  # Table containing column mappings
-$TableMappingTable = "ETL.Table_Mapping"      # Table mapping FilePattern to TargetTable
+$TableMappingTable = "ETL.Table_Mapping"      # Table mapping FilePattern to TargetTable and SheetName
 $BatchSize = 1000                             # Maximum number of rows to insert per query
 
 # Load ImportExcel module for Excel file handling
@@ -45,7 +45,7 @@ foreach ($File in $Files) {
 
     # Fetch table mapping for FilePattern
     $TableMappingQuery = @"
-    SELECT PayorName, TargetTable, FilePattern
+    SELECT PayorName, TargetTable, FilePattern, SheetName
     FROM $TableMappingTable
     WHERE '$SourceFileName' LIKE REPLACE(FilePattern, '*', '%');
 "@
@@ -57,7 +57,8 @@ foreach ($File in $Files) {
         }
         $PayorName = $TableMapping.PayorName
         $TargetTable = $TableMapping.TargetTable
-        Log_Message "Mapping found for file: $SourceFileName, $PayorName targeting table: $TargetTable."
+        $SheetName = $TableMapping.SheetName
+        Log_Message "Mapping found for file: $SourceFileName, $PayorName targeting table: $TargetTable with Sheet: $SheetName."
     } catch {
         Log_Message "Failed to retrieve table mapping for file: $SourceFileName : $_"
         continue
@@ -108,7 +109,13 @@ foreach ($File in $Files) {
         if ($FileExtension -eq ".csv") {
             $FileContent = Import-Csv -Path $FilePath -Delimiter ','
         } elseif ($FileExtension -eq ".xlsx" -or $FileExtension -eq ".xls") {
-            $FileContent = Import-Excel -Path $FilePath
+            if ([string]::IsNullOrWhiteSpace($SheetName)) {
+                $FileContent = Import-Excel -Path $FilePath
+                Log_Message "Loaded default sheet from Excel file: $SourceFileName."
+            } else {
+                $FileContent = Import-Excel -Path $FilePath -WorksheetName $SheetName
+                Log_Message "Loaded specified sheet: $SheetName from Excel file: $SourceFileName."
+            }
         } else {
             Log_Message "Unsupported file type: $FileExtension for file $SourceFileName"
             continue
