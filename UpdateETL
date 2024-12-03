@@ -1,6 +1,5 @@
 # ==========================================
 # Enhanced ETL Template Script for CSV and Excel to SQL Server
-# Optimized for Performance
 # ==========================================
 
 # Configuration
@@ -107,7 +106,7 @@ foreach ($File in $Files) {
     # Load and transform content based on file type
     try {
         if ($FileExtension -eq ".csv") {
-            $FileContent = Import-Csv -Path $FilePath -Delimiter ',' #-Quote '"'
+            $FileContent = Import-Csv -Path $FilePath -Delimiter ','
         } elseif ($FileExtension -eq ".xlsx" -or $FileExtension -eq ".xls") {
             $FileContent = Import-Excel -Path $FilePath
         } else {
@@ -127,10 +126,6 @@ foreach ($File in $Files) {
             foreach ($IncomingColumn in $MappingDict.Keys) {
                 $MappedColumn = $MappingDict[$IncomingColumn]
                 switch ($MappedColumn) {
-                    "EffectiveKey" {
-                        $Parts = $SourceFileName -split '_'
-                        $Values += "'$($Parts[2].Substring(0, 6))'"
-                    }
                     "SourceFileName" {
                         $Values += "'$($SourceFileName -replace "'", "''")'"
                     }
