@@ -1,4 +1,4 @@
-==========================================
+# ==========================================
 # Enhanced ETL Template Script for CSV to SQL Server
 # Optimized for Performance
 # ==========================================
@@ -112,10 +112,6 @@ foreach ($File in $Files) {
             foreach ($IncomingColumn in $MappingDict.Keys) {
                 $MappedColumn = $MappingDict[$IncomingColumn]
                 switch ($MappedColumn) {
-                    "EffectiveKey" {
-                        $Parts = $SourceFileName -split '_'
-                        $Values += "'$($Parts[2].Substring(0, 6))'"
-                    }
                     "SourceFileName" {
                         $Values += "'$($SourceFileName -replace "'", "''")'"
                     }
