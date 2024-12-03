@@ -10,7 +10,7 @@ $DataMappingTable = "ETL.Claim_Data_Mapping"  # Table containing column mappings
 $TableMappingTable = "ETL.Table_Mapping"      # Table mapping FilePattern to TargetTable and SheetName
 $BatchSize = 1000                             # Maximum number of rows to insert per query
 
-# Load ImportExcel module for Excel file handling
+# Ensure ImportExcel module is installed
 if (-not (Get-Module -ListAvailable -Name ImportExcel)) {
     Install-Module -Name ImportExcel -Scope CurrentUser -Force
 }
@@ -58,7 +58,7 @@ foreach ($File in $Files) {
         $PayorName = $TableMapping.PayorName
         $TargetTable = $TableMapping.TargetTable
         $SheetName = $TableMapping.SheetName
-        Log_Message "Mapping found for file: $SourceFileName, $PayorName targeting table: $TargetTable with Sheet: $SheetName."
+        Log_Message "Mapping found for file: $SourceFileName, targeting table: $TargetTable."
     } catch {
         Log_Message "Failed to retrieve table mapping for file: $SourceFileName : $_"
         continue
@@ -98,12 +98,6 @@ foreach ($File in $Files) {
         $MappingDict[$Row.IncomingColumnName] = $Row.StandardizedColumnName
     }
 
-    # Verify file exists
-    if (-not (Test-Path -Path $FilePath)) {
-        Log_Message "File not found: $FilePath"
-        continue
-    }
-
     # Load and transform content based on file type
     try {
         if ($FileExtension -eq ".csv") {
@@ -111,10 +105,8 @@ foreach ($File in $Files) {
         } elseif ($FileExtension -eq ".xlsx" -or $FileExtension -eq ".xls") {
             if ([string]::IsNullOrWhiteSpace($SheetName)) {
                 $FileContent = Import-Excel -Path $FilePath
-                Log_Message "Loaded default sheet from Excel file: $SourceFileName."
             } else {
                 $FileContent = Import-Excel -Path $FilePath -WorksheetName $SheetName
-                Log_Message "Loaded specified sheet: $SheetName from Excel file: $SourceFileName."
             }
         } else {
             Log_Message "Unsupported file type: $FileExtension for file $SourceFileName"
@@ -132,19 +124,8 @@ foreach ($File in $Files) {
             $Values = @()
             foreach ($IncomingColumn in $MappingDict.Keys) {
                 $MappedColumn = $MappingDict[$IncomingColumn]
-                switch ($MappedColumn) {
-                    "SourceFileName" {
-                        $Values += "'$($SourceFileName -replace "'", "''")'"
-                    }
-                    default {
-                        $Value = $_.$IncomingColumn -replace "'", "''"
-                        if ($Value -ne "") {
-                            $Values += "'$Value'"
-                        } else {
-                            $Values += "NULL"
-                        }
-                    }
-                }
+                $Value = $_.$IncomingColumn -replace "'", "''"
+                $Values += $Value -ne "" ? "'$Value'" : "NULL"
             }
             "($($Values -join ','))"
         }
@@ -164,7 +145,6 @@ foreach ($File in $Files) {
                 VALUES
                 $($BatchRows -join ",`n");
 "@
-                Write-Host "Executing Batch Insert Query: $BatchInsertQuery" # Debugging
                 try {
                     Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $BatchInsertQuery -TrustServerCertificate
                     Log_Message "Inserted batch of $($BatchRows.Count) rows for file: $SourceFileName."
