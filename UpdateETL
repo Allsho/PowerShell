@@ -1,15 +1,20 @@
 # ==========================================
-# Enhanced ETL Template Script for CSV to SQL Server
-# Optimized for Performance
+# Enhanced ETL Template Script for CSV and Excel to SQL Server
 # ==========================================
 
 # Configuration
 $ServerName = ""                              # SQL Server name or IP address
 $Database = "ClaimsStage"                     # Database to store the data
-$FolderPath = ""                              # Directory containing CSV files to process
+$FolderPath = ""                              # Directory containing files to process
 $DataMappingTable = "ETL.Claim_Data_Mapping"  # Table containing column mappings
 $TableMappingTable = "ETL.Table_Mapping"      # Table mapping FilePattern to TargetTable
 $BatchSize = 1000                             # Maximum number of rows to insert per query
+
+# Load ImportExcel module for Excel file handling
+if (-not (Get-Module -ListAvailable -Name ImportExcel)) {
+    Install-Module -Name ImportExcel -Scope CurrentUser -Force
+}
+Import-Module ImportExcel
 
 # Function: Log a message to the database
 function Log_Message {
@@ -27,7 +32,7 @@ function Log_Message {
 }
 
 # Process files in the folder
-$Files = Get-ChildItem -Path $FolderPath -Filter "*.csv"
+$Files = Get-ChildItem -Path $FolderPath -Include "*.csv", "*.xlsx", "*.xls" -Recurse
 if ($Files.Count -eq 0) {
     Write-Host "No files found in folder: $FolderPath"
     exit
@@ -36,6 +41,7 @@ if ($Files.Count -eq 0) {
 foreach ($File in $Files) {
     $FilePath = $File.FullName
     $SourceFileName = $File.Name
+    $FileExtension = $File.Extension.ToLower()
 
     # Fetch table mapping for FilePattern
     $TableMappingQuery = @"
@@ -97,25 +103,29 @@ foreach ($File in $Files) {
         continue
     }
 
-    # Load and transform CSV content
+    # Load and transform content based on file type
     try {
-        $CsvContent = Import-Csv -Path $FilePath -Delimiter ',' #-Quote '"'
-        if ($CsvContent.Count -eq 0) {
+        if ($FileExtension -eq ".csv") {
+            $FileContent = Import-Csv -Path $FilePath -Delimiter ','
+        } elseif ($FileExtension -eq ".xlsx" -or $FileExtension -eq ".xls") {
+            $FileContent = Import-Excel -Path $FilePath
+        } else {
+            Log_Message "Unsupported file type: $FileExtension for file $SourceFileName"
+            continue
+        }
+
+        if ($FileContent.Count -eq 0) {
             Log_Message "No data in file: $FilePath"
             continue
         }
-        Log_Message "Loaded file: $SourceFileName successfully with $($CsvContent.Count) rows."
+        Log_Message "Loaded file: $SourceFileName successfully with $($FileContent.Count) rows."
 
         # Preprocess and transform rows
-        $TransformedRows = $CsvContent | ForEach-Object {
+        $TransformedRows = $FileContent | ForEach-Object {
             $Values = @()
             foreach ($IncomingColumn in $MappingDict.Keys) {
                 $MappedColumn = $MappingDict[$IncomingColumn]
                 switch ($MappedColumn) {
-                    "EffectiveKey" {
-                        $Parts = $SourceFileName -split '_'
-                        $Values += "'$($Parts[2].Substring(0, 6))'"
-                    }
                     "SourceFileName" {
                         $Values += "'$($SourceFileName -replace "'", "''")'"
                     }
@@ -145,7 +155,7 @@ foreach ($File in $Files) {
                 $BatchInsertQuery = @"
                 INSERT INTO $TargetTable ($ColumnHeaders)
                 VALUES
-                $($BatchRows -join ",n");
+                $($BatchRows -join ",`n");
 "@
                 Write-Host "Executing Batch Insert Query: $BatchInsertQuery" # Debugging
                 try {
@@ -158,7 +168,7 @@ foreach ($File in $Files) {
             }
         }
     } catch {
-        Log_Message "Failed to load or transform CSV file: $SourceFileName : $_"
+        Log_Message "Failed to load or transform file: $SourceFileName : $_"
         continue
     }
 }
