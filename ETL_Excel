@@ -1,0 +1,176 @@
+# ==========================================
+# ETL Script for Excel to SQL Server
+# ==========================================
+
+# Configuration
+$ServerName = ""                              # SQL Server name or IP address
+$Database = "ClaimsStage"                     # Database to store the data
+$FolderPath = ""                              # Directory containing Excel files to process
+$DataMappingTable = "ETL.Claim_Data_Mapping"  # Table containing column mappings
+$TableMappingTable = "ETL.Table_Mapping"      # Table mapping FilePattern to TargetTable
+$BatchSize = 1000                             # Maximum number of rows to insert per query
+
+# Function: Log a message to the database
+function Log_Message {
+    param ([string]$Message)
+    $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $LogQuery = @"
+    INSERT INTO ETL.Payor_Log (Timestamp, PayorName, LogMessage)
+    VALUES ('$Timestamp', '$PayorName', '$Message');
+"@
+    try {
+        Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $LogQuery -TrustServerCertificate
+    } catch {
+        Write-Host "Failed to log message to database: $_"
+    }
+}
+
+# Process files in the folder
+$Files = Get-ChildItem -Path $FolderPath -Filter "*.xls*"
+if ($Files.Count -eq 0) {
+    Write-Host "No Excel files found in folder: $FolderPath"
+    exit
+}
+
+foreach ($File in $Files) {
+    $FilePath = $File.FullName
+    $SourceFileName = $File.Name
+
+    # Fetch table mapping for FilePattern
+    $TableMappingQuery = @"
+    SELECT PayorName, TargetTable, FilePattern, SheetName, ArchivePath
+    FROM $TableMappingTable
+    WHERE '$SourceFileName' LIKE REPLACE(FilePattern, '*', '%') AND FileType = 'Excel';
+"@
+    try {
+        $TableMapping = Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $TableMappingQuery -TrustServerCertificate
+        if ($TableMapping.Count -eq 0) {
+            Write-Host "No table mapping found for file: $SourceFileName."
+            continue
+        }
+        $PayorName = $TableMapping.PayorName
+        $TargetTable = $TableMapping.TargetTable
+        $SheetName = $TableMapping.SheetName
+        $ArchiveBasePath = $TableMapping.ArchivePath
+        Log_Message "Mapping found for file: $SourceFileName, PayorName: $PayorName targeting table: $TargetTable with sheet: $SheetName."
+    } catch {
+        Log_Message "Failed to retrieve table mapping for file: $SourceFileName : $_"
+        continue
+    }
+
+    # Truncate target table
+    $TruncateQuery = "TRUNCATE TABLE $TargetTable;"
+    try {
+        Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $TruncateQuery -TrustServerCertificate
+        Log_Message "Staging table $TargetTable truncated successfully."
+    } catch {
+        Log_Message "Failed to truncate table $TargetTable : $_"
+        continue
+    }
+
+    # Fetch column mappings
+    $MappingQuery = @"
+    SELECT IncomingColumnName, StandardizedColumnName
+    FROM $DataMappingTable
+    WHERE PayorName = '$PayorName';
+"@
+    try {
+        $Mappings = Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $MappingQuery -TrustServerCertificate
+        if ($Mappings.Count -eq 0) {
+            Log_Message "No column mappings found for PayorName: $PayorName."
+            continue
+        }
+        Log_Message "Fetched column mappings successfully for PayorName: $PayorName."
+    } catch {
+        Log_Message "Failed to retrieve column mappings: $_"
+        continue
+    }
+
+    # Create mapping dictionary
+    $MappingDict = @{ }
+    foreach ($Row in $Mappings) {
+        $MappingDict[$Row.IncomingColumnName] = $Row.StandardizedColumnName
+    }
+
+    # Load Excel content
+    try {
+        $Excel = New-Object -ComObject Excel.Application
+        $Workbook = $Excel.Workbooks.Open($FilePath)
+        $Worksheet = $Workbook.Sheets.Item($SheetName)
+        $Range = $Worksheet.UsedRange
+        $ExcelData = @()
+        $Header = @()
+
+        # Process header
+        for ($col = 1; $col -le $Range.Columns.Count; $col++) {
+            $Header += $Range.Cells.Item(1, $col).Text
+        }
+
+        # Process data rows
+        for ($row = 2; $row -le $Range.Rows.Count; $row++) {
+            $RowData = @{}
+            for ($col = 1; $col -le $Range.Columns.Count; $col++) {
+                $ColumnName = $Header[$col - 1]
+                $RowData[$ColumnName] = $Range.Cells.Item($row, $col).Text
+            }
+            $ExcelData += [PSCustomObject]$RowData
+        }
+        $Workbook.Close()
+        $Excel.Quit()
+        [System.Runtime.InteropServices.Marshal]::ReleaseComObject($Excel)
+        Log_Message "Loaded file: $SourceFileName successfully with $($ExcelData.Count) rows."
+    } catch {
+        Log_Message "Failed to load Excel file: $SourceFileName : $_"
+        continue
+    }
+
+    # Prepare and insert data
+    $ColumnHeaders = ($MappingDict.Values | ForEach-Object { "[$_]" }) -join ","
+    $RowCounter = 0
+    $BatchRows = @()
+
+    foreach ($Row in $ExcelData) {
+        $Values = @()
+        foreach ($IncomingColumn in $MappingDict.Keys) {
+            $MappedColumn = $MappingDict[$IncomingColumn]
+            $Value = $Row.$IncomingColumn -replace "'", "''"
+            $Values += $Value -ne "" ? "'$Value'" : "NULL"
+        }
+        $BatchRows += "($($Values -join ','))"
+        $RowCounter++
+
+        # Process batch
+        if ($RowCounter % $BatchSize -eq 0 -or $RowCounter -eq $ExcelData.Count) {
+            if ($BatchRows.Count -gt 0) {
+                $BatchInsertQuery = @"
+                INSERT INTO $TargetTable ($ColumnHeaders)
+                VALUES
+                $($BatchRows -join ",`n");
+"@
+                try {
+                    Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $BatchInsertQuery -TrustServerCertificate
+                    Log_Message "Inserted batch of $($BatchRows.Count) rows for file: $SourceFileName."
+                } catch {
+                    Log_Message "Failed to insert batch for file: $SourceFileName : $_"
+                }
+            }
+            $BatchRows = @()
+        }
+    }
+
+    # Archive file
+    try {
+        $CurrentYearMonth = (Get-Date -Format "yyyyMM")
+        $ArchivePath = Join-Path $ArchiveBasePath $CurrentYearMonth
+        if (-not (Test-Path -Path $ArchivePath)) {
+            New-Item -Path $ArchivePath -ItemType Directory
+        }
+        Move-Item -Path $FilePath -Destination (Join-Path $ArchivePath $SourceFileName)
+        Log_Message "Archived file: $SourceFileName to $ArchivePath."
+    } catch {
+        Log_Message "Failed to archive file: $SourceFileName : $_"
+    }
+}
+
+# Final log
+Log_Message "ETL process completed for all Excel files in folder: $FolderPath."
