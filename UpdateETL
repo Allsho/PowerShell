@@ -1,5 +1,5 @@
 # ==========================================
-# CSV ETL Script for SQL Server
+# CSV ETL Script for SQL Server with Archiving
 # ==========================================
 
 # Configuration
@@ -38,7 +38,7 @@ foreach ($File in $Files) {
 
     # Fetch table mapping for CSV files only
     $TableMappingQuery = @"
-    SELECT PayorName, TargetTable, FilePattern
+    SELECT PayorName, TargetTable, FilePattern, ArchivePath
     FROM $TableMappingTable
     WHERE FileType = 'CSV' AND '$SourceFileName' LIKE REPLACE(FilePattern, '*', '%');
 "@
@@ -50,10 +50,26 @@ foreach ($File in $Files) {
         }
         $PayorName = $TableMapping.PayorName
         $TargetTable = $TableMapping.TargetTable
+        $ArchiveBasePath = $TableMapping.ArchivePath
         Log_Message "Mapping found for file: $SourceFileName, $PayorName targeting table: $TargetTable."
     } catch {
         Log_Message "Failed to retrieve table mapping for CSV file: $SourceFileName : $_"
         continue
+    }
+
+    # Determine archive folder path
+    $CurrentYearMonth = (Get-Date).ToString("yyyyMM")
+    $ArchivePath = Join-Path -Path $ArchiveBasePath -ChildPath $CurrentYearMonth
+
+    # Create archive folder if it doesn't exist
+    if (-not (Test-Path -Path $ArchivePath)) {
+        try {
+            New-Item -ItemType Directory -Path $ArchivePath -Force | Out-Null
+            Log_Message "Created archive folder: $ArchivePath."
+        } catch {
+            Log_Message "Failed to create archive folder: $ArchivePath : $_"
+            continue
+        }
     }
 
     # Truncate target table
@@ -141,13 +157,12 @@ foreach ($File in $Files) {
     
         # Process batch when size is reached or at the end
         if ($RowCounter % $BatchSize -eq 0 -or $RowCounter -eq $CsvContent.Count) {
-            if ($BatchRows.Count -gt 0) {  # Ensure there are rows to insert
+            if ($BatchRows.Count -gt 0) {
                 $BatchInsertQuery = @"
                 INSERT INTO $TargetTable ($ColumnHeaders)
                 VALUES
                 $($BatchRows -join ",`n");
 "@
-                Write-Host "Executing Batch Insert Query: $BatchInsertQuery" # Debugging
                 try {
                     Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $BatchInsertQuery -TrustServerCertificate
                     Log_Message "Inserted batch of $($BatchRows.Count) rows for CSV file: $SourceFileName."
@@ -155,9 +170,17 @@ foreach ($File in $Files) {
                     Log_Message "Failed to insert batch for file: $SourceFileName : $_"
                 }
             }
-            # Clear batch memory properly
             $BatchRows = @()
         }
+    }
+
+    # Archive the file
+    $ArchiveFilePath = Join-Path -Path $ArchivePath -ChildPath $SourceFileName
+    try {
+        Move-Item -Path $FilePath -Destination $ArchiveFilePath -Force
+        Log_Message "File archived successfully to: $ArchiveFilePath."
+    } catch {
+        Log_Message "Failed to archive file: $SourceFileName to $ArchiveFilePath : $_"
     }
 }
 
