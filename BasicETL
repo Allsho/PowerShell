@@ -1,27 +1,19 @@
 # ==========================================
-# ETL Template Script for CSV to SQL Server
+# Enhanced ETL Template Script for CSV to SQL Server
 # ==========================================
 
 # Configuration
-$ServerName = ""
-$Database = "ClaimsStage"
-$FilePath = ""
-$DataMappingTable = "ETL.Claim_Data_Mapping"  # Table for mapping information
-$TargetTable = ""  # Table for the target load
-$PayorName = ""
-#$LogFile = "H:\Developers\Projects\PowershellApps\logs\ETL_Anthem.log"
-$BatchSize = 1000  # Maximum rows per insert statement
+$ServerName = ""                              # SQL Server name or IP address
+$Database = "ClaimsStage"                     # Database to store the data
+$FolderPath = ""                              # Directory containing CSV files to process
+$DataMappingTable = "ETL.Claim_Data_Mapping"  # Table containing column mappings
+$TableMappingTable = "ETL.Table_Mapping"      # Table mapping FilePattern to TargetTable
+$BatchSize = 1000                             # Maximum number of rows to insert per query
 
-# Extract just the file name from the full file path
-$SourceFileName = Split-Path -Path $FilePath -Leaf
-
-# Function: Log a message to the log file
+# Function: Log a message to the database
 function Log_Message {
-    param (
-        [string]$Message
-    )
+    param ([string]$Message)
     $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    #Add-Content -Path $LogFile -Value "$Timestamp - $Message" # used for internal logging.
     $LogQuery = @"
     INSERT INTO ETL.Payor_Log (Timestamp, PayorName, LogMessage)
     VALUES ('$Timestamp', '$PayorName', '$Message');
@@ -33,156 +25,141 @@ function Log_Message {
     }
 }
 
-# Start ETL process logging
-Log_Message "ETL process started for PayorName: $PayorName."
+# Process files in the folder
+$Files = Get-ChildItem -Path $FolderPath -Filter "*.csv"
+if ($Files.Count -eq 0) {
+    Write-Host "No files found in folder: $FolderPath"
+    exit
+}
 
-# Section 0: Truncate and Prep ETL
-$TruncateQuery = @"
-TRUNCATE TABLE $TargetTable;
+foreach ($File in $Files) {
+    $FilePath = $File.FullName
+    $SourceFileName = $File.Name
+
+    # Fetch table mapping for FilePattern
+    $TableMappingQuery = @"
+    SELECT PayorName, TargetTable, FilePattern
+    FROM $TableMappingTable
+    WHERE '$SourceFileName' LIKE REPLACE(FilePattern, '*', '%');
 "@
-
-try {
-    Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $TruncateQuery -TrustServerCertificate
-    Log_Message "Staging table $TargetTable truncated successfully."
-} catch {
-    Log_Message "Failed to truncate staging table $TargetTable : $_"
-    exit
-}
-
-# -----------------------------------------
-# Section 1: Fetch Column Mappings (Extract)
-# -----------------------------------------
-$MappingQuery = @"
-SELECT IncomingColumnName, StandardizedColumnName
-FROM $DataMappingTable
-WHERE PayorName = '$PayorName';
-"@
-
-try {
-    $Mappings = Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $MappingQuery -TrustServerCertificate
-    Log_Message "Fetched column mappings successfully."
-} catch {
-    Log_Message "Failed to retrieve column mappings: $_"
-    exit
-}
-
-if ($Mappings.Count -eq 0) {
-    Log_Message "No mappings found for PayorName: $PayorName. Exiting script."
-    exit
-}
-
-# Build mapping dictionary
-$MappingDict = @{ }
-foreach ($row in $Mappings) {
-    $MappingDict[$row.IncomingColumnName] = $row.StandardizedColumnName
-}
-Log_Message "Mapping dictionary created with keys: $($MappingDict.Keys -join ', ')."
-
-# -----------------------------------------
-# Section 2: Verify File Exists
-# -----------------------------------------
-if (-not (Test-Path -Path $FilePath)) {
-    Log_Message "File not found: $FilePath"
-    exit
-}
-
-# -----------------------------------------
-# Section 3: Load and Transform Data (Transform)
-# -----------------------------------------
-try {
-    # Detect if the file is a single-column CSV
-    $FirstLine = Get-Content -Path $FilePath -First 1
-    $IsSingleColumn = ($FirstLine -notmatch ",") -and ($FirstLine -match "\S")
-
-    if ($IsSingleColumn) {
-        # Transform single-column data into a structured format
-        $csvContent = @()
-        $ICNColumn = "ICN"
-        $DataRows = Get-Content -Path $FilePath | Select-Object -Skip 1
-        foreach ($row in $DataRows) {
-            $csvContent += [PSCustomObject]@{ $ICNColumn = $row }
-        }
-        Log_Message "Detected single-column CSV. Processed $($csvContent.Count) rows."
-    } else {
-        # Process as a standard CSV
-        $csvContent = Import-Csv -Path $FilePath -Delimiter ',' -Quote '"'
-        Log_Message "Loaded standard CSV file successfully with $($csvContent.Count) rows."
-    }
-} catch {
-    Log_Message "Failed to load CSV file: $_"
-    exit
-}
-
-# Transform rows into SQL-compatible values
-$TransformedRows = @()
-foreach ($row in $csvContent) {
-    $Values = @()
-    foreach ($IncomingColumn in $MappingDict.Keys) {
-        switch ($MappingDict[$IncomingColumn]) {
-            "EffectiveKey" {
-                $Parts = $SourceFileName -split '_'
-                if($Parts.Count -gt 2) {
-                    $Values += $Parts[2].Substring(0, 6)
-                } else {
-                    log_message "Unable to extract EffectiveKey date: insufficient segments in filename."
-                }
-                #Not in use $Values += "GETDATE()"  # EffectiveKey
-            }
-            "SourceFileName" {
-                $Values += "'$($SourceFileName -replace "'", "''")'"  # SourceFileName
-            }
-            default {
-                if ($row.PSObject.Properties[$IncomingColumn]) {
-                    # Map normal columns
-                    $Value = $row.$IncomingColumn -replace "'", "''" # Escape single, double quotes
-                    $Value = $Value -replace '^"|"$', '' # Remove leading and trailing double quotes
-                    $Values += "'$Value'"
-                } else {
-                    # Handle missing values as NULL
-                    $Values += "NULL"
-                }
-            }
-        }
-    }
-    $TransformedRows += "($($Values -join ','))"
-}
-
-if ($TransformedRows.Count -eq 0) {
-    Log_Message "No data to insert. Exiting script."
-    exit
-}
-
-# -----------------------------------------
-# Section 4: Batch Insert Query (Load)
-# -----------------------------------------
-$ColumnHeaders = $MappingDict.Values -join ","  # Include all mapped columns
-$TotalRows = $TransformedRows.Count
-$InsertedRows = 0
-
-while ($InsertedRows -lt $TotalRows) {
-    # Get the next batch
-    $Batch = $TransformedRows[$InsertedRows..([Math]::Min($InsertedRows + $BatchSize - 1, $TotalRows - 1))]
-    
-    # Create the INSERT query for the current batch
-    $BatchInsertQuery = @"
-INSERT INTO $TargetTable ($ColumnHeaders)
-VALUES
-$($Batch -join ",`n");
-"@
-
     try {
-        # Execute the batch insert
-        Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $BatchInsertQuery -TrustServerCertificate
-        Log_Message "Inserted batch of $($Batch.Count) rows successfully."
+        $TableMapping = Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $TableMappingQuery -TrustServerCertificate
+        if ($TableMapping.Count -eq 0) {
+            Log_Message "No table mapping found for file: $SourceFileName."
+            continue
+        }
+        $PayorName = $TableMapping.PayorName
+        $TargetTable = $TableMapping.TargetTable
+        Log_Message "Mapping found for file: $SourceFileName, $PayorName targeting table: $TargetTable."
     } catch {
-        Log_Message "Error inserting batch: $_"
+        Log_Message "Failed to retrieve table mapping for file: $SourceFileName : $_"
+        continue
     }
 
-    # Update the count of inserted rows
-    $InsertedRows += $Batch.Count
+    # Truncate target table
+    $TruncateQuery = "TRUNCATE TABLE $TargetTable;"
+    try {
+        Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $TruncateQuery -TrustServerCertificate
+        Log_Message "Staging table $TargetTable truncated successfully."
+    } catch {
+        Log_Message "Failed to truncate table $TargetTable : $_"
+        continue
+    }
+
+    # Fetch column mappings
+    $MappingQuery = @"
+    SELECT IncomingColumnName, StandardizedColumnName
+    FROM $DataMappingTable
+    WHERE PayorName = '$PayorName';
+"@
+    try {
+        $Mappings = Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $MappingQuery -TrustServerCertificate
+        if ($Mappings.Count -eq 0) {
+            Log_Message "No column mappings found for PayorName: $PayorName."
+            continue
+        }
+        Log_Message "Fetched column mappings successfully for PayorName: $PayorName."
+    } catch {
+        Log_Message "Failed to retrieve column mappings: $_"
+        continue
+    }
+
+    # Create mapping dictionary
+    $MappingDict = @{ }
+    foreach ($Row in $Mappings) {
+        $MappingDict[$Row.IncomingColumnName] = $Row.StandardizedColumnName
+    }
+
+    # Verify file exists
+    if (-not (Test-Path -Path $FilePath)) {
+        Log_Message "File not found: $FilePath"
+        continue
+    }
+
+    # Load and transform CSV content
+    try {
+        $CsvContent = Import-Csv -Path $FilePath -Delimiter ',' #-Quote '"'
+        if ($CsvContent.Count -eq 0) {
+            Log_Message "No data in file: $FilePath"
+            continue
+        }
+        Log_Message "Loaded file: $SourceFileName successfully with $($CsvContent.Count) rows."
+    } catch {
+        Log_Message "Failed to load CSV file: $SourceFileName : $_"
+        continue
+    }
+
+    # Prepare headers for insertion
+    $ColumnHeaders = ($MappingDict.Values | ForEach-Object { "[$_]" }) -join ","
+    $RowCounter = 0
+    $BatchRows = @()
+
+    foreach ($Row in $CsvContent) {
+        $Values = @()
+        foreach ($IncomingColumn in $MappingDict.Keys) {
+            $MappedColumn = $MappingDict[$IncomingColumn]
+            switch ($MappedColumn) {
+                "EffectiveKey" {
+                    $Parts = $SourceFileName -split '_'
+                    $Values += $Parts[2].Substring(0, 6)
+                }
+                "SourceFileName" {
+                    $Values += "'$($SourceFileName -replace "'", "''")'"
+                }
+                default {
+                    $Value = $Row.$IncomingColumn -replace "'", "''"
+                    if ($Value -ne "") {
+                        $Values += "'$Value'"
+                    } else {
+                        $Values += "NULL"
+                    }
+                }
+            }
+        }
+        $BatchRows += "($($Values -join ','))"
+        $RowCounter++
+    
+        # Process batch when size is reached or at the end
+        if ($RowCounter % $BatchSize -eq 0 -or $RowCounter -eq $CsvContent.Count) {
+            if ($BatchRows.Count -gt 0) {  # Ensure there are rows to insert
+                $BatchInsertQuery = @"
+                INSERT INTO $TargetTable ($ColumnHeaders)
+                VALUES
+                $($BatchRows -join ",`n");
+"@
+                Write-Host "Executing Batch Insert Query: $BatchInsertQuery" # Debugging
+                try {
+                    Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $BatchInsertQuery -TrustServerCertificate
+                    Log_Message "Inserted batch of $($BatchRows.Count) rows for file: $SourceFileName."
+                } catch {
+                    Log_Message "Failed to insert batch for file: $SourceFileName : $_"
+                }
+            }
+            # Clear batch memory properly
+            $BatchRows = @()
+        }
+    }
 }
 
-# -----------------------------------------
-# Finalize Logging
-# -----------------------------------------
-Log_Message "ETL process completed for PayorName: $PayorName."
+# Final log
+Log_Message "ETL process completed for all files in folder: $FolderPath."
