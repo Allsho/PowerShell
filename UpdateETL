@@ -1,20 +1,14 @@
 # ==========================================
-# Enhanced ETL Template Script for CSV and Excel to SQL Server
+# CSV ETL Script for SQL Server
 # ==========================================
 
 # Configuration
 $ServerName = ""                              # SQL Server name or IP address
 $Database = "ClaimsStage"                     # Database to store the data
-$FolderPath = ""                              # Directory containing files to process
+$FolderPath = ""                              # Directory containing CSV files to process
 $DataMappingTable = "ETL.Claim_Data_Mapping"  # Table containing column mappings
 $TableMappingTable = "ETL.Table_Mapping"      # Table mapping FilePattern to TargetTable
 $BatchSize = 1000                             # Maximum number of rows to insert per query
-
-# Load ImportExcel module for Excel file handling
-if (-not (Get-Module -ListAvailable -Name ImportExcel)) {
-    Install-Module -Name ImportExcel -Scope CurrentUser -Force
-}
-Import-Module ImportExcel
 
 # Function: Log a message to the database
 function Log_Message {
@@ -32,34 +26,33 @@ function Log_Message {
 }
 
 # Process files in the folder
-$Files = Get-ChildItem -Path $FolderPath -Include "*.csv", "*.xlsx", "*.xls" -Recurse
+$Files = Get-ChildItem -Path $FolderPath -Filter "*.csv"
 if ($Files.Count -eq 0) {
-    Write-Host "No files found in folder: $FolderPath"
+    Write-Host "No CSV files found in folder: $FolderPath"
     exit
 }
 
 foreach ($File in $Files) {
     $FilePath = $File.FullName
     $SourceFileName = $File.Name
-    $FileExtension = $File.Extension.ToLower()
 
-    # Fetch table mapping for FilePattern
+    # Fetch table mapping for CSV files only
     $TableMappingQuery = @"
     SELECT PayorName, TargetTable, FilePattern
     FROM $TableMappingTable
-    WHERE '$SourceFileName' LIKE REPLACE(FilePattern, '*', '%');
+    WHERE FileType = 'CSV' AND '$SourceFileName' LIKE REPLACE(FilePattern, '*', '%');
 "@
     try {
         $TableMapping = Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $TableMappingQuery -TrustServerCertificate
         if ($TableMapping.Count -eq 0) {
-            Log_Message "No table mapping found for file: $SourceFileName."
+            Log_Message "No table mapping found for CSV file: $SourceFileName."
             continue
         }
         $PayorName = $TableMapping.PayorName
         $TargetTable = $TableMapping.TargetTable
         Log_Message "Mapping found for file: $SourceFileName, $PayorName targeting table: $TargetTable."
     } catch {
-        Log_Message "Failed to retrieve table mapping for file: $SourceFileName : $_"
+        Log_Message "Failed to retrieve table mapping for CSV file: $SourceFileName : $_"
         continue
     }
 
@@ -103,55 +96,52 @@ foreach ($File in $Files) {
         continue
     }
 
-    # Load and transform content based on file type
+    # Load and transform CSV content
     try {
-        if ($FileExtension -eq ".csv") {
-            $FileContent = Import-Csv -Path $FilePath -Delimiter ','
-        } elseif ($FileExtension -eq ".xlsx" -or $FileExtension -eq ".xls") {
-            $FileContent = Import-Excel -Path $FilePath
-        } else {
-            Log_Message "Unsupported file type: $FileExtension for file $SourceFileName"
-            continue
-        }
-
-        if ($FileContent.Count -eq 0) {
+        $CsvContent = Import-Csv -Path $FilePath -Delimiter ',' #-Quote '"'
+        if ($CsvContent.Count -eq 0) {
             Log_Message "No data in file: $FilePath"
             continue
         }
-        Log_Message "Loaded file: $SourceFileName successfully with $($FileContent.Count) rows."
+        Log_Message "Loaded CSV file: $SourceFileName successfully with $($CsvContent.Count) rows."
+    } catch {
+        Log_Message "Failed to load CSV file: $SourceFileName : $_"
+        continue
+    }
 
-        # Preprocess and transform rows
-        $TransformedRows = $FileContent | ForEach-Object {
-            $Values = @()
-            foreach ($IncomingColumn in $MappingDict.Keys) {
-                $MappedColumn = $MappingDict[$IncomingColumn]
-                switch ($MappedColumn) {
-                    "SourceFileName" {
-                        $Values += "'$($SourceFileName -replace "'", "''")'"
-                    }
-                    default {
-                        $Value = $_.$IncomingColumn -replace "'", "''"
-                        if ($Value -ne "") {
-                            $Values += "'$Value'"
-                        } else {
-                            $Values += "NULL"
-                        }
+    # Prepare headers for insertion
+    $ColumnHeaders = ($MappingDict.Values | ForEach-Object { "[$_]" }) -join ","
+    $RowCounter = 0
+    $BatchRows = @()
+
+    foreach ($Row in $CsvContent) {
+        $Values = @()
+        foreach ($IncomingColumn in $MappingDict.Keys) {
+            $MappedColumn = $MappingDict[$IncomingColumn]
+            switch ($MappedColumn) {
+                "EffectiveKey" {
+                    $Parts = $SourceFileName -split '_'
+                    $Values += $Parts[2].Substring(0, 6)
+                }
+                "SourceFileName" {
+                    $Values += "'$($SourceFileName -replace "'", "''")'"
+                }
+                default {
+                    $Value = $Row.$IncomingColumn -replace "'", "''"
+                    if ($Value -ne "") {
+                        $Values += "'$Value'"
+                    } else {
+                        $Values += "NULL"
                     }
                 }
             }
-            "($($Values -join ','))"
         }
-
-        # Insert transformed data in batches
-        $ColumnHeaders = ($MappingDict.Values | ForEach-Object { "[$_]" }) -join ","
-        $BatchRows = @()
-        $RowCounter = 0
-
-        foreach ($Row in $TransformedRows) {
-            $BatchRows.Add($Row)
-            $RowCounter++
-
-            if ($RowCounter % $BatchSize -eq 0 -or $RowCounter -eq $TransformedRows.Count) {
+        $BatchRows += "($($Values -join ','))"
+        $RowCounter++
+    
+        # Process batch when size is reached or at the end
+        if ($RowCounter % $BatchSize -eq 0 -or $RowCounter -eq $CsvContent.Count) {
+            if ($BatchRows.Count -gt 0) {  # Ensure there are rows to insert
                 $BatchInsertQuery = @"
                 INSERT INTO $TargetTable ($ColumnHeaders)
                 VALUES
@@ -160,18 +150,16 @@ foreach ($File in $Files) {
                 Write-Host "Executing Batch Insert Query: $BatchInsertQuery" # Debugging
                 try {
                     Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $BatchInsertQuery -TrustServerCertificate
-                    Log_Message "Inserted batch of $($BatchRows.Count) rows for file: $SourceFileName."
+                    Log_Message "Inserted batch of $($BatchRows.Count) rows for CSV file: $SourceFileName."
                 } catch {
                     Log_Message "Failed to insert batch for file: $SourceFileName : $_"
                 }
-                $BatchRows.Clear()
             }
+            # Clear batch memory properly
+            $BatchRows = @()
         }
-    } catch {
-        Log_Message "Failed to load or transform file: $SourceFileName : $_"
-        continue
     }
 }
 
 # Final log
-Log_Message "ETL process completed for all files in folder: $FolderPath."
+Log_Message "CSV ETL process completed for all files in folder: $FolderPath."
