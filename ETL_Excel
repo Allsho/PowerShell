@@ -132,9 +132,12 @@ foreach ($File in $Files) {
     foreach ($Row in $ExcelData) {
         $Values = @()
         foreach ($IncomingColumn in $MappingDict.Keys) {
-            $MappedColumn = $MappingDict[$IncomingColumn]
             $Value = $Row.$IncomingColumn -replace "'", "''"
-            $Values += $Value -ne "" ? "'$Value'" : "NULL"
+            if ($Value -and $Value.Trim() -ne "") {
+                $Values += "'$Value'"
+            } else {
+                $Values += "NULL"
+            }
         }
         $BatchRows += "($($Values -join ','))"
         $RowCounter++
