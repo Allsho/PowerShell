@@ -1,5 +1,5 @@
 # ==========================================
-# Enhanced ETL Template Script for CSV to SQL Server
+# CSV ETL Script for SQL Server with Archiving
 # ==========================================
 
 # Configuration
@@ -28,7 +28,7 @@ function Log_Message {
 # Process files in the folder
 $Files = Get-ChildItem -Path $FolderPath -Filter "*.csv"
 if ($Files.Count -eq 0) {
-    Write-Host "No files found in folder: $FolderPath"
+    Write-Host "No CSV files found in folder: $FolderPath"
     exit
 }
 
@@ -36,24 +36,40 @@ foreach ($File in $Files) {
     $FilePath = $File.FullName
     $SourceFileName = $File.Name
 
-    # Fetch table mapping for FilePattern
+    # Fetch table mapping for CSV files only
     $TableMappingQuery = @"
-    SELECT PayorName, TargetTable, FilePattern
+    SELECT PayorName, TargetTable, FilePattern, ArchivePath
     FROM $TableMappingTable
-    WHERE '$SourceFileName' LIKE REPLACE(FilePattern, '*', '%');
+    WHERE FileType = 'CSV' AND '$SourceFileName' LIKE REPLACE(FilePattern, '*', '%');
 "@
     try {
         $TableMapping = Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $TableMappingQuery -TrustServerCertificate
         if ($TableMapping.Count -eq 0) {
-            Log_Message "No table mapping found for file: $SourceFileName."
+            Log_Message "No table mapping found for CSV file: $SourceFileName."
             continue
         }
         $PayorName = $TableMapping.PayorName
         $TargetTable = $TableMapping.TargetTable
+        $ArchiveBasePath = $TableMapping.ArchivePath
         Log_Message "Mapping found for file: $SourceFileName, $PayorName targeting table: $TargetTable."
     } catch {
-        Log_Message "Failed to retrieve table mapping for file: $SourceFileName : $_"
+        Log_Message "Failed to retrieve table mapping for CSV file: $SourceFileName : $_"
         continue
+    }
+
+    # Determine archive folder path
+    $CurrentYearMonth = (Get-Date).ToString("yyyyMM")
+    $ArchivePath = Join-Path -Path $ArchiveBasePath -ChildPath $CurrentYearMonth
+
+    # Create archive folder if it doesn't exist
+    if (-not (Test-Path -Path $ArchivePath)) {
+        try {
+            New-Item -ItemType Directory -Path $ArchivePath -Force | Out-Null
+            Log_Message "Created archive folder: $ArchivePath."
+        } catch {
+            Log_Message "Failed to create archive folder: $ArchivePath : $_"
+            continue
+        }
     }
 
     # Truncate target table
@@ -103,7 +119,7 @@ foreach ($File in $Files) {
             Log_Message "No data in file: $FilePath"
             continue
         }
-        Log_Message "Loaded file: $SourceFileName successfully with $($CsvContent.Count) rows."
+        Log_Message "Loaded CSV file: $SourceFileName successfully with $($CsvContent.Count) rows."
     } catch {
         Log_Message "Failed to load CSV file: $SourceFileName : $_"
         continue
@@ -141,25 +157,32 @@ foreach ($File in $Files) {
     
         # Process batch when size is reached or at the end
         if ($RowCounter % $BatchSize -eq 0 -or $RowCounter -eq $CsvContent.Count) {
-            if ($BatchRows.Count -gt 0) {  # Ensure there are rows to insert
+            if ($BatchRows.Count -gt 0) {
                 $BatchInsertQuery = @"
                 INSERT INTO $TargetTable ($ColumnHeaders)
                 VALUES
                 $($BatchRows -join ",`n");
 "@
-                Write-Host "Executing Batch Insert Query: $BatchInsertQuery" # Debugging
                 try {
                     Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $BatchInsertQuery -TrustServerCertificate
-                    Log_Message "Inserted batch of $($BatchRows.Count) rows for file: $SourceFileName."
+                    Log_Message "Inserted batch of $($BatchRows.Count) rows for CSV file: $SourceFileName."
                 } catch {
                     Log_Message "Failed to insert batch for file: $SourceFileName : $_"
                 }
             }
-            # Clear batch memory properly
             $BatchRows = @()
         }
+    }
+
+    # Archive the file
+    $ArchiveFilePath = Join-Path -Path $ArchivePath -ChildPath $SourceFileName
+    try {
+        Move-Item -Path $FilePath -Destination $ArchiveFilePath -Force
+        Log_Message "File archived successfully to: $ArchiveFilePath."
+    } catch {
+        Log_Message "Failed to archive file: $SourceFileName to $ArchiveFilePath : $_"
     }
 }
 
 # Final log
-Log_Message "ETL process completed for all files in folder: $FolderPath."
+Log_Message "CSV ETL process completed for all files in folder: $FolderPath."
