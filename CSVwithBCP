@@ -1,5 +1,5 @@
 # ==========================================
-# CSV ETL Script for SQL Server with Archiving and BCP
+# CSV ETL Script for SQL Server with Archiving
 # ==========================================
 
 # Configuration
@@ -8,15 +8,15 @@ $Database = "ClaimsStage"                     # Database to store the data
 $FolderPath = ""                              # Directory containing CSV files to process
 $DataMappingTable = "ETL.Claim_Data_Mapping"  # Table containing column mappings
 $TableMappingTable = "ETL.Table_Mapping"      # Table mapping FilePattern to TargetTable
-$BCPExecutable = "C:\\Program Files\\Microsoft SQL Server\\Client SDK\\ODBC\\170\\Tools\\Binn\\bcp.exe"  # Path to BCP executable
+$BatchSize = 100                             # Maximum number of rows to insert per query
 
 # Function: Log a message to the database
 function Log_Message {
     param ([string]$Message)
     $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $LogQuery = @"
-    INSERT INTO ETL.Payor_Log (Timestamp, PayorName, LogMessage)
-    VALUES ('$Timestamp', '$PayorName', '$Message');
+    INSERT INTO ETL.Payor_Log (Timestamp, LogMessage)
+    VALUES ('$Timestamp', '$Message');
 "@
     try {
         Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $LogQuery -TrustServerCertificate
@@ -72,6 +72,35 @@ foreach ($File in $Files) {
         }
     }
 
+    # Load and transform CSV content
+    try {
+        $CsvContent = Import-Csv -Path $FilePath -Delimiter ',' #-Quote '"'
+        if ($CsvContent.Count -eq 0) {
+            Log_Message "No data in file: $FilePath"
+            continue
+        }
+        Log_Message "Loaded CSV file: $SourceFileName successfully with $($CsvContent.Count) rows."
+
+        # Establish column headers for insertion
+        $CsvHeaders = $CsvContent[0].PSObject.Properties.Name
+        $ColumnHeaders = @()
+        $HeaderMappingDict = @{}
+
+        foreach ($CsvHeader in $CsvHeaders) {
+            if ($MappingDict.ContainsKey($CsvHeader)) {
+                $StandardizedColumn = $MappingDict[$CsvHeader]
+                $HeaderMappingDict[$CsvHeader] = $StandardizedColumn
+                $ColumnHeaders += "[$StandardizedColumn]"
+            } else {
+                Log_Message "Unmapped column: $CsvHeader. Skipping."
+            }
+        }
+        $ColumnHeadersString = $ColumnHeaders -join ","
+    } catch {
+        Log_Message "Failed to load or process headers for CSV file: $SourceFileName : $_"
+        continue
+    }
+
     # Truncate target table
     $TruncateQuery = "TRUNCATE TABLE $TargetTable;"
     try {
@@ -82,61 +111,41 @@ foreach ($File in $Files) {
         continue
     }
 
-    # Fetch column mappings
-    $MappingQuery = @"
-    SELECT IncomingColumnName, StandardizedColumnName
-    FROM $DataMappingTable
-    WHERE PayorName = '$PayorName';
-"@
-    try {
-        $Mappings = Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $MappingQuery -TrustServerCertificate
-        if ($Mappings.Count -eq 0) {
-            Log_Message "No column mappings found for PayorName: $PayorName."
-            continue
-        }
-        Log_Message "Fetched column mappings successfully for PayorName: $PayorName."
-    } catch {
-        Log_Message "Failed to retrieve column mappings: $_"
-        continue
-    }
+    # Insert CSV rows with batch processing
+    $RowCounter = 0
+    $BatchRows = @()
 
-    # Create a temporary transformed CSV file for BCP
-    $TempFilePath = Join-Path -Path $FolderPath -ChildPath "$($SourceFileName).transformed.csv"
-    try {
-        $CsvContent = Import-Csv -Path $FilePath -Delimiter ','
-        $TransformedData = @()
-
-        foreach ($Row in $CsvContent) {
-            $TransformedRow = @()
-            foreach ($Mapping in $Mappings) {
-                $Value = $Row.$($Mapping.IncomingColumnName) -replace "'", "''"
-                $TransformedRow += $Value
+    foreach ($Row in $CsvContent) {
+        $Values = @()
+        foreach ($CsvHeader in $CsvHeaders) {
+            if ($MappingDict.ContainsKey($CsvHeader)) {
+                $MappedColumn = $MappingDict[$CsvHeader]
+                $Value = $Row.$CsvHeader -replace "'", "''"
+                $Values += "'$Value'"
             }
-            $TransformedData += ($TransformedRow -join ',')
         }
 
-        # Save transformed data to temporary file
-        $TransformedData | Set-Content -Path $TempFilePath
-        Log_Message "Transformed data saved to temporary file: $TempFilePath."
-    } catch {
-        Log_Message "Failed to transform data for file: $SourceFileName : $_"
-        continue
-    }
+        $BatchRows += "($($Values -join ','))"
+        $RowCounter++
 
-    # Use BCP to load data into the target table
-    $BCPCommand = @"
-    & "$BCPExecutable" "$TargetTable" IN "$TempFilePath" -c -t"," -S "$ServerName" -d "$Database" -T
+        # Insert batch logic
+        if ($RowCounter % $BatchSize -eq 0 -or $RowCounter -eq $CsvContent.Count) {
+            if ($BatchRows.Count -gt 0) {
+                $BatchInsertQuery = @"
+                INSERT INTO $TargetTable ($ColumnHeadersString)
+                VALUES
+                $($BatchRows -join ",`n");
 "@
-    try {
-        Invoke-Expression -Command $BCPCommand
-        Log_Message "Data successfully loaded into table: $TargetTable using BCP."
-    } catch {
-        Log_Message "BCP failed for file: $SourceFileName : $_"
-        continue
+                try {
+                    Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $BatchInsertQuery -TrustServerCertificate
+                    Log_Message "Inserted batch of $($BatchRows.Count) rows for CSV file: $SourceFileName."
+                } catch {
+                    Log_Message "Failed to insert batch for file: $SourceFileName : $_"
+                }
+            }
+            $BatchRows = @()
+        }
     }
-
-    # Cleanup temporary file
-    Remove-Item -Path $TempFilePath -Force
 
     # Archive the file
     $ArchiveFilePath = Join-Path -Path $ArchivePath -ChildPath $SourceFileName
@@ -147,6 +156,3 @@ foreach ($File in $Files) {
         Log_Message "Failed to archive file: $SourceFileName to $ArchiveFilePath : $_"
     }
 }
-
-# Final log
-Log_Message "CSV ETL process completed for all files in folder: $FolderPath."
