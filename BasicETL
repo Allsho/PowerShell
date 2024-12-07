@@ -1,5 +1,5 @@
 # ==========================================
-# CSV ETL Script for SQL Server with Archiving
+# Optimized CSV ETL Script for SQL Server with Archiving
 # ==========================================
 
 # Configuration
@@ -127,50 +127,33 @@ foreach ($File in $Files) {
 
     # Prepare headers for insertion
     $ColumnHeaders = ($MappingDict.Values | ForEach-Object { "[$_]" }) -join ","
-    $RowCounter = 0
     $BatchRows = @()
+    $RowCounter = 0
 
     foreach ($Row in $CsvContent) {
         $Values = @()
         foreach ($IncomingColumn in $MappingDict.Keys) {
             $MappedColumn = $MappingDict[$IncomingColumn]
-            switch ($MappedColumn) {
-                "EffectiveKey" {
-                    $Parts = $SourceFileName -split '_'
-                    $Values += $Parts[2].Substring(0, 6)
-                }
-                "SourceFileName" {
-                    $Values += "'$($SourceFileName -replace "'", "''")'"
-                }
-                default {
-                    $Value = $Row.$IncomingColumn -replace "'", "''"
-                    if ($Value -ne "") {
-                        $Values += "'$Value'"
-                    } else {
-                        $Values += "NULL"
-                    }
-                }
-            }
+            $Value = $Row.$IncomingColumn -replace "'", "''"
+            $Values += if ($Value -eq "") { "NULL" } else { "'$Value'" }
         }
         $BatchRows += "($($Values -join ','))"
         $RowCounter++
     
-        # Process batch when size is reached or at the end
+        # Insert batch when limit is reached or at the end
         if ($RowCounter % $BatchSize -eq 0 -or $RowCounter -eq $CsvContent.Count) {
-            if ($BatchRows.Count -gt 0) {
-                $BatchInsertQuery = @"
-                INSERT INTO $TargetTable ($ColumnHeaders)
-                VALUES
-                $($BatchRows -join ",`n");
+            $BatchInsertQuery = @"
+            INSERT INTO $TargetTable ($ColumnHeaders)
+            VALUES
+            $($BatchRows -join ",");
 "@
-                try {
-                    Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $BatchInsertQuery -TrustServerCertificate
-                    Log_Message "Inserted batch of $($BatchRows.Count) rows for CSV file: $SourceFileName."
-                } catch {
-                    Log_Message "Failed to insert batch for file: $SourceFileName : $_"
-                }
+            try {
+                Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $BatchInsertQuery -TrustServerCertificate
+                Log_Message "Inserted batch of $BatchSize rows for CSV file: $SourceFileName."
+            } catch {
+                Log_Message "Failed to insert batch for file: $SourceFileName : $_"
             }
-            $BatchRows = @()
+            $BatchRows = @()  # Reset batch
         }
     }
 
@@ -186,61 +169,3 @@ foreach ($File in $Files) {
 
 # Final log
 Log_Message "CSV ETL process completed for all files in folder: $FolderPath."
-
-
-
-
-# Stream and process CSV content line by line
-try {
-    $Reader = [System.IO.StreamReader]::new($FilePath)
-    $Headers = $Reader.ReadLine().Split(',')
-
-    $RowCounter = 0
-    $BatchRows = @()
-
-    while ($Reader.Peek() -ge 0) {
-        $Line = $Reader.ReadLine()
-        $Values = $Line.Split(',')
-        $MappedValues = @()
-
-        foreach ($Header in $Headers) {
-            if ($MappingDict.ContainsKey($Header)) {
-                $MappedColumn = $MappingDict[$Header]
-                $Value = $Values[$Headers.IndexOf($Header)] -replace "'", "''"
-
-                if ($Value -ne "") {
-                    $MappedValues += "'$Value'"
-                } else {
-                    $MappedValues += "NULL"
-                }
-            }
-        }
-        $BatchRows += "($($MappedValues -join ','))"
-        $RowCounter++
-
-        # Insert batch
-        if ($RowCounter % $BatchSize -eq 0 -or $Reader.Peek() -lt 0) {
-            if ($BatchRows.Count -gt 0) {
-                $BatchInsertQuery = @"
-                INSERT INTO $TargetTable ($ColumnHeaders)
-                VALUES
-                $($BatchRows -join ",n");
-"@
-                try {
-                    Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $BatchInsertQuery -TrustServerCertificate
-                    Log_Message "Inserted batch of $($BatchRows.Count) rows."
-                } catch {
-                    Log_Message "Batch insert failed: $_"
-                }
-            }
-            $BatchRows = @()
-        }
-    }
-
-    $Reader.Close()
-    Log_Message "File processed: $FilePath with $RowCounter rows."
-} catch {
-    Log_Message "Failed to process CSV file: $FilePath : $_"
-} finally {
-    if ($Reader) { $Reader.Close() }
-}
