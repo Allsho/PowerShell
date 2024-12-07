@@ -1,5 +1,5 @@
 # ==========================================
-# Optimized CSV ETL Script for SQL Server with Archiving
+# CSV ETL Script for SQL Server with Archiving
 # ==========================================
 
 # Configuration
@@ -8,7 +8,7 @@ $Database = "ClaimsStage"                     # Database to store the data
 $FolderPath = ""                              # Directory containing CSV files to process
 $DataMappingTable = "ETL.Claim_Data_Mapping"  # Table containing column mappings
 $TableMappingTable = "ETL.Table_Mapping"      # Table mapping FilePattern to TargetTable
-$BatchSize = 1000                             # Maximum number of rows to insert per query
+$BatchSize = 100                             # Maximum number of rows to insert per query
 
 # Function: Log a message to the database
 function Log_Message {
@@ -127,33 +127,50 @@ foreach ($File in $Files) {
 
     # Prepare headers for insertion
     $ColumnHeaders = ($MappingDict.Values | ForEach-Object { "[$_]" }) -join ","
-    $BatchRows = @()
     $RowCounter = 0
+    $BatchRows = @()
 
     foreach ($Row in $CsvContent) {
         $Values = @()
         foreach ($IncomingColumn in $MappingDict.Keys) {
             $MappedColumn = $MappingDict[$IncomingColumn]
-            $Value = $Row.$IncomingColumn -replace "'", "''"
-            $Values += if ($Value -eq "") { "NULL" } else { "'$Value'" }
+            switch ($MappedColumn) {
+                "EffectiveKey" {
+                    $Parts = $SourceFileName -split '_'
+                    $Values += $Parts[2].Substring(0, 6)
+                }
+                "SourceFileName" {
+                    $Values += "'$($SourceFileName -replace "'", "''")'"
+                }
+                default {
+                    $Value = $Row.$IncomingColumn -replace "'", "''"
+                    if ($Value -ne "") {
+                        $Values += "'$Value'"
+                    } else {
+                        $Values += "NULL"
+                    }
+                }
+            }
         }
         $BatchRows += "($($Values -join ','))"
         $RowCounter++
     
-        # Insert batch when limit is reached or at the end
+        # Process batch when size is reached or at the end
         if ($RowCounter % $BatchSize -eq 0 -or $RowCounter -eq $CsvContent.Count) {
-            $BatchInsertQuery = @"
-            INSERT INTO $TargetTable ($ColumnHeaders)
-            VALUES
-            $($BatchRows -join ",");
+            if ($BatchRows.Count -gt 0) {
+                $BatchInsertQuery = @"
+                INSERT INTO $TargetTable ($ColumnHeaders)
+                VALUES
+                $($BatchRows -join ",`n");
 "@
-            try {
-                Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $BatchInsertQuery -TrustServerCertificate
-                Log_Message "Inserted batch of $BatchSize rows for CSV file: $SourceFileName."
-            } catch {
-                Log_Message "Failed to insert batch for file: $SourceFileName : $_"
+                try {
+                    Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $BatchInsertQuery -TrustServerCertificate
+                    Log_Message "Inserted batch of $($BatchRows.Count) rows for CSV file: $SourceFileName."
+                } catch {
+                    Log_Message "Failed to insert batch for file: $SourceFileName : $_"
+                }
             }
-            $BatchRows = @()  # Reset batch
+            $BatchRows = @()
         }
     }
 
