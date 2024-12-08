@@ -15,31 +15,14 @@ function Log_Message {
     param ([string]$Message)
     $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $LogQuery = @"
-    INSERT INTO ETL.Payor_Log (Timestamp, LogMessage)
-    VALUES ('$Timestamp', '$Message');
+    INSERT INTO ETL.Payor_Log (Timestamp, PayorName, LogMessage)
+    VALUES ('$Timestamp', '$PayorName', '$Message');
 "@
     try {
         Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $LogQuery -TrustServerCertificate
     } catch {
         Write-Host "Failed to log message to database: $_"
     }
-}
-
-# Load column mappings into a dictionary
-function Load_Column_Mappings {
-    $MappingQuery = "SELECT SourceColumn, TargetColumn FROM $DataMappingTable;"
-    $MappingDict = @{}
-    try {
-        $Mappings = Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $MappingQuery -TrustServerCertificate
-        foreach ($Mapping in $Mappings) {
-            $MappingDict[$Mapping.SourceColumn] = $Mapping.TargetColumn
-        }
-        Log_Message "Loaded column mappings successfully."
-    } catch {
-        Log_Message "Failed to load column mappings: $_"
-        throw
-    }
-    return $MappingDict
 }
 
 # Process files in the folder
@@ -49,14 +32,11 @@ if ($Files.Count -eq 0) {
     exit
 }
 
-# Load column mappings once
-$MappingDict = Load_Column_Mappings
-
 foreach ($File in $Files) {
     $FilePath = $File.FullName
     $SourceFileName = $File.Name
 
-    # Fetch table mapping for the file
+    # Fetch table mapping for CSV files only
     $TableMappingQuery = @"
     SELECT PayorName, TargetTable, FilePattern, ArchivePath
     FROM $TableMappingTable
@@ -92,36 +72,6 @@ foreach ($File in $Files) {
         }
     }
 
-    # Load and transform CSV content
-    try {
-        $CsvContent = Import-Csv -Path $FilePath -Delimiter ','
-        if ($CsvContent.Count -eq 0) {
-            Log_Message "No data in file: $FilePath"
-            continue
-        }
-        Log_Message "Loaded CSV file: $SourceFileName successfully with $($CsvContent.Count) rows."
-
-        # Map headers to database columns
-        $CsvHeaders = $CsvContent[0].PSObject.Properties.Name
-        $MappedColumns = @()
-        foreach ($CsvHeader in $CsvHeaders) {
-            if ($MappingDict.ContainsKey($CsvHeader)) {
-                $MappedColumns += "[$($MappingDict[$CsvHeader])]"
-            } else {
-                Log_Message "Unmapped column: $CsvHeader. Skipping."
-            }
-        }
-
-        if ($MappedColumns.Count -eq 0) {
-            Log_Message "No valid columns to map for file: $SourceFileName."
-            continue
-        }
-        $MappedColumnsString = $MappedColumns -join ","
-    } catch {
-        Log_Message "Failed to load or process headers for CSV file: $SourceFileName : $_"
-        continue
-    }
-
     # Truncate target table
     $TruncateQuery = "TRUNCATE TABLE $TargetTable;"
     try {
@@ -132,28 +82,85 @@ foreach ($File in $Files) {
         continue
     }
 
-    # Insert CSV rows with batch processing
+    # Fetch column mappings
+    $MappingQuery = @"
+    SELECT IncomingColumnName, StandardizedColumnName
+    FROM $DataMappingTable
+    WHERE PayorName = '$PayorName';
+"@
+    try {
+        $Mappings = Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $MappingQuery -TrustServerCertificate
+        if ($Mappings.Count -eq 0) {
+            Log_Message "No column mappings found for PayorName: $PayorName."
+            continue
+        }
+        Log_Message "Fetched column mappings successfully for PayorName: $PayorName."
+    } catch {
+        Log_Message "Failed to retrieve column mappings: $_"
+        continue
+    }
+
+    # Create mapping dictionary
+    $MappingDict = @{ }
+    foreach ($Row in $Mappings) {
+        $MappingDict[$Row.IncomingColumnName] = $Row.StandardizedColumnName
+    }
+
+    # Verify file exists
+    if (-not (Test-Path -Path $FilePath)) {
+        Log_Message "File not found: $FilePath"
+        continue
+    }
+
+    # Load and transform CSV content
+    try {
+        $CsvContent = Import-Csv -Path $FilePath -Delimiter ',' #-Quote '"'
+        if ($CsvContent.Count -eq 0) {
+            Log_Message "No data in file: $FilePath"
+            continue
+        }
+        Log_Message "Loaded CSV file: $SourceFileName successfully with $($CsvContent.Count) rows."
+    } catch {
+        Log_Message "Failed to load CSV file: $SourceFileName : $_"
+        continue
+    }
+
+    # Prepare headers for insertion
+    $ColumnHeaders = ($MappingDict.Values | ForEach-Object { "[$_]" }) -join ","
     $RowCounter = 0
     $BatchRows = @()
 
     foreach ($Row in $CsvContent) {
         $Values = @()
-        foreach ($CsvHeader in $CsvHeaders) {
-            if ($MappingDict.ContainsKey($CsvHeader)) {
-                $MappedColumn = $MappingDict[$CsvHeader]
-                $Value = $Row.$CsvHeader -replace "'", "''"
-                $Values += "'$Value'"
+        foreach ($IncomingColumn in $MappingDict.Keys) {
+            $MappedColumn = $MappingDict[$IncomingColumn]
+            switch ($MappedColumn) {
+                "EffectiveKey" {
+                    $Parts = $SourceFileName -split '_'
+                    $Values += $Parts[2].Substring(0, 6)
+                    Write-Host "$Values "
+                }
+                "SourceFileName" {
+                    $Values += "'$($SourceFileName -replace "'", "''")'"
+                }
+                default {
+                    $Value = $Row.$IncomingColumn -replace "'", "''"
+                    if ($Value -ne "") {
+                        $Values += "'$Value'"
+                    } else {
+                        $Values += "NULL"
+                    }
+                }
             }
         }
-
         $BatchRows += "($($Values -join ','))"
         $RowCounter++
-
-        # Insert batch logic
+    
+        # Process batch when size is reached or at the end
         if ($RowCounter % $BatchSize -eq 0 -or $RowCounter -eq $CsvContent.Count) {
             if ($BatchRows.Count -gt 0) {
                 $BatchInsertQuery = @"
-                INSERT INTO $TargetTable ($MappedColumnsString)
+                INSERT INTO $TargetTable ($ColumnHeaders)
                 VALUES
                 $($BatchRows -join ",`n");
 "@
@@ -177,3 +184,6 @@ foreach ($File in $Files) {
         Log_Message "Failed to archive file: $SourceFileName to $ArchiveFilePath : $_"
     }
 }
+
+# Final log
+Log_Message "CSV ETL process completed for all files in folder: $FolderPath."
