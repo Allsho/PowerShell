@@ -1,5 +1,5 @@
 # ==========================================
-# CSV ETL Script for SQL Server with Archiving
+# Optimized CSV ETL Script for SQL Server with Archiving
 # ==========================================
 
 # Configuration
@@ -8,15 +8,15 @@ $Database = "ClaimsStage"                     # Database to store the data
 $FolderPath = ""                              # Directory containing CSV files to process
 $DataMappingTable = "ETL.Claim_Data_Mapping"  # Table containing column mappings
 $TableMappingTable = "ETL.Table_Mapping"      # Table mapping FilePattern to TargetTable
-$BatchSize = 100                             # Maximum number of rows to insert per query
+$BatchSize = 100                              # Maximum number of rows to insert per query
 
 # Function: Log a message to the database
 function Log_Message {
     param ([string]$Message)
     $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $LogQuery = @"
-    INSERT INTO ETL.Payor_Log (Timestamp, LogMessage)
-    VALUES ('$Timestamp', '$Message');
+    INSERT INTO ETL.Payor_Log (Timestamp, PayorName, LogMessage)
+    VALUES ('$Timestamp', '$PayorName', '$Message');
 "@
     try {
         Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $LogQuery -TrustServerCertificate
@@ -36,7 +36,7 @@ foreach ($File in $Files) {
     $FilePath = $File.FullName
     $SourceFileName = $File.Name
 
-    # Fetch table mapping for CSV files only
+    # Fetch table mapping for the file
     $TableMappingQuery = @"
     SELECT PayorName, TargetTable, FilePattern, ArchivePath
     FROM $TableMappingTable
@@ -57,11 +57,8 @@ foreach ($File in $Files) {
         continue
     }
 
-    # Determine archive folder path
-    $CurrentYearMonth = (Get-Date).ToString("yyyyMM")
-    $ArchivePath = Join-Path -Path $ArchiveBasePath -ChildPath $CurrentYearMonth
-
-    # Create archive folder if it doesn't exist
+    # Create archive folder
+    $ArchivePath = Join-Path -Path $ArchiveBasePath -ChildPath (Get-Date).ToString("yyyyMM")
     if (-not (Test-Path -Path $ArchivePath)) {
         try {
             New-Item -ItemType Directory -Path $ArchivePath -Force | Out-Null
@@ -72,87 +69,93 @@ foreach ($File in $Files) {
         }
     }
 
-    # Load and transform CSV content
-    try {
-        $CsvContent = Import-Csv -Path $FilePath -Delimiter ',' #-Quote '"'
-        if ($CsvContent.Count -eq 0) {
-            Log_Message "No data in file: $FilePath"
-            continue
-        }
-        Log_Message "Loaded CSV file: $SourceFileName successfully with $($CsvContent.Count) rows."
-
-        # Establish column headers for insertion
-        $CsvHeaders = $CsvContent[0].PSObject.Properties.Name
-        $ColumnHeaders = @()
-        $HeaderMappingDict = @{}
-
-        foreach ($CsvHeader in $CsvHeaders) {
-            if ($MappingDict.ContainsKey($CsvHeader)) {
-                $StandardizedColumn = $MappingDict[$CsvHeader]
-                $HeaderMappingDict[$CsvHeader] = $StandardizedColumn
-                $ColumnHeaders += "[$StandardizedColumn]"
-            } else {
-                Log_Message "Unmapped column: $CsvHeader. Skipping."
-            }
-        }
-        $ColumnHeadersString = $ColumnHeaders -join ","
-    } catch {
-        Log_Message "Failed to load or process headers for CSV file: $SourceFileName : $_"
-        continue
-    }
-
     # Truncate target table
-    $TruncateQuery = "TRUNCATE TABLE $TargetTable;"
     try {
-        Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $TruncateQuery -TrustServerCertificate
+        Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query "TRUNCATE TABLE $TargetTable;" -TrustServerCertificate
         Log_Message "Staging table $TargetTable truncated successfully."
     } catch {
         Log_Message "Failed to truncate table $TargetTable : $_"
         continue
     }
 
-    # Insert CSV rows with batch processing
-    $RowCounter = 0
+    # Fetch column mappings
+    $MappingQuery = @"
+    SELECT IncomingColumnName, StandardizedColumnName
+    FROM $DataMappingTable
+    WHERE PayorName = '$PayorName';
+"@
+    try {
+        $Mappings = Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $MappingQuery -TrustServerCertificate
+        if ($Mappings.Count -eq 0) {
+            Log_Message "No column mappings found for PayorName: $PayorName."
+            continue
+        }
+        Log_Message "Fetched column mappings successfully for PayorName: $PayorName."
+    } catch {
+        Log_Message "Failed to retrieve column mappings: $_"
+        continue
+    }
+
+    # Build mapping dictionary
+    $MappingDict = @{}
+    $Mappings | ForEach-Object { $MappingDict[$_.IncomingColumnName] = $_.StandardizedColumnName }
+
+    # Load CSV content
+    try {
+        $CsvContent = Import-Csv -Path $FilePath -Delimiter ','
+        if ($CsvContent.Count -eq 0) {
+            Log_Message "No data in file: $FilePath"
+            continue
+        }
+        Log_Message "Loaded CSV file: $SourceFileName successfully with $($CsvContent.Count) rows."
+    } catch {
+        Log_Message "Failed to load CSV file: $SourceFileName : $_"
+        continue
+    }
+
+    # Prepare headers and batch rows
+    $ColumnHeaders = ($MappingDict.Values | ForEach-Object { "[$_]" }) -join ","
     $BatchRows = @()
 
     foreach ($Row in $CsvContent) {
-        $Values = @()
-        foreach ($CsvHeader in $CsvHeaders) {
-            if ($MappingDict.ContainsKey($CsvHeader)) {
-                $MappedColumn = $MappingDict[$CsvHeader]
-                $Value = $Row.$CsvHeader -replace "'", "''"
-                $Values += "'$Value'"
+        $Values = $MappingDict.Keys | ForEach-Object {
+            $MappedColumn = $MappingDict[$_]
+            switch ($MappedColumn) {
+                "EffectiveKey" { ($SourceFileName -split '_')[2].Substring(0, 6) }
+                "SourceFileName" { "'$($SourceFileName -replace "'", "''")'" }
+                default {
+                    $Value = $Row.$_ -replace "'", "''"
+                    if ($Value -ne "") { "'$Value'" } else { "NULL" }
+                }
             }
         }
-
         $BatchRows += "($($Values -join ','))"
-        $RowCounter++
 
-        # Insert batch logic
-        if ($RowCounter % $BatchSize -eq 0 -or $RowCounter -eq $CsvContent.Count) {
-            if ($BatchRows.Count -gt 0) {
-                $BatchInsertQuery = @"
-                INSERT INTO $TargetTable ($ColumnHeadersString)
-                VALUES
-                $($BatchRows -join ",`n");
+        # Insert batch when size is reached or at the end
+        if ($BatchRows.Count -ge $BatchSize -or $BatchRows.Count -eq $CsvContent.Count) {
+            $BatchInsertQuery = @"
+            INSERT INTO $TargetTable ($ColumnHeaders)
+            VALUES
+            $($BatchRows -join ",`n");
 "@
-                try {
-                    Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $BatchInsertQuery -TrustServerCertificate
-                    Log_Message "Inserted batch of $($BatchRows.Count) rows for CSV file: $SourceFileName."
-                } catch {
-                    Log_Message "Failed to insert batch for file: $SourceFileName : $_"
-                }
+            try {
+                Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $BatchInsertQuery -TrustServerCertificate
+                Log_Message "Inserted batch of $($BatchRows.Count) rows for CSV file: $SourceFileName."
+            } catch {
+                Log_Message "Failed to insert batch for file: $SourceFileName : $_"
             }
             $BatchRows = @()
         }
     }
 
     # Archive the file
-    $ArchiveFilePath = Join-Path -Path $ArchivePath -ChildPath $SourceFileName
     try {
-        Move-Item -Path $FilePath -Destination $ArchiveFilePath -Force
-        Log_Message "File archived successfully to: $ArchiveFilePath."
+        Move-Item -Path $FilePath -Destination (Join-Path -Path $ArchivePath -ChildPath $SourceFileName) -Force
+        Log_Message "File archived successfully to: $ArchivePath."
     } catch {
-        Log_Message "Failed to archive file: $SourceFileName to $ArchiveFilePath : $_"
+        Log_Message "Failed to archive file: $SourceFileName : $_"
     }
 }
+
+# Final log
+Log_Message "CSV ETL process completed for all files in folder: $FolderPath."
