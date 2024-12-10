@@ -8,7 +8,7 @@ $Database = "ClaimsStage"                     # Database to store the data
 $FolderPath = ""                              # Directory containing CSV files to process
 $DataMappingTable = "ETL.Claim_Data_Mapping"  # Table containing column mappings
 $TableMappingTable = "ETL.Table_Mapping"      # Table mapping FilePattern to TargetTable
-$BatchSize = 100                              # Maximum number of rows to insert per query
+$BatchSize = 1000                            # Maximum number of rows to insert per query
 
 # Function: Log a message to the database
 function Log_Message {
@@ -116,23 +116,27 @@ foreach ($File in $Files) {
 
     # Load and transform CSV content
     try {
-        $CsvContent = Import-Csv -Path $FilePath -Delimiter ',' #-Quote '"'
-    
+        $CsvContent = Import-Csv -Path $FilePath -Delimiter ','
+        
         # Check if CSV is empty or improperly formatted
         if (-not $CsvContent -or $CsvContent.Count -eq 0) {
             Log_Message "CSV file $FilePath is empty or has no rows. Skipping."
             continue
         }
-        
+
         # Verify headers exist
         if (-not $CsvContent[0].PSObject.Properties.Name) {
             Log_Message "CSV file $FilePath is improperly formatted or missing headers. Skipping."
             continue
         }
-        
-        # Add SourceFileName to all rows
-        $CsvContent | ForEach-Object { $_.SourceFileName = $SourceFileName }
-        Log_Message "Loaded CSV file: $SourceFileName successfully with $($CsvContent.Count) rows."
+
+        # Build column mapping pipeline only if CSV loaded successfully
+        $AlignedColumns = @{}
+        foreach ($Mapping in $Mappings) {
+            if ($CsvContent[0].PSObject.Properties[$Mapping.IncomingColumnName]) {
+                $AlignedColumns[$Mapping.IncomingColumnName] = $Mapping.StandardizedColumnName
+            }
+        }
     } catch {
         Log_Message "Error processing CSV file $SourceFileName $_"
         continue
@@ -179,54 +183,3 @@ foreach ($File in $Files) {
 
 # Final log
 Log_Message "CSV ETL process completed for all files in folder: $FolderPath."
-
-
-
-# Load and transform CSV content
-try {
-    $CsvContent = Import-Csv -Path $FilePath -Delimiter ','
-    
-    # Check if CSV is empty or improperly formatted
-    if (-not $CsvContent -or $CsvContent.Count -eq 0) {
-        Log_Message "CSV file $FilePath is empty or has no rows. Skipping."
-        continue
-    }
-
-    # Verify headers exist
-    if (-not $CsvContent[0].PSObject.Properties.Name) {
-        Log_Message "CSV file $FilePath is improperly formatted or missing headers. Skipping."
-        continue
-    }
-
-    # Build column mapping pipeline only if CSV loaded successfully
-    $AlignedColumns = @{}
-    foreach ($Mapping in $Mappings) {
-        if ($CsvContent[0].PSObject.Properties[$Mapping.IncomingColumnName]) {
-            $AlignedColumns[$Mapping.IncomingColumnName] = $Mapping.StandardizedColumnName
-        }
-    }
-} catch {
-    Log_Message "Error processing CSV file $SourceFileName: $_"
-    continue
-}
-
-$TableMappingQuery = @"
-SELECT PayorName, TargetTable, FilePattern, ArchivePath
-FROM $TableMappingTable
-WHERE FileType = 'CSV' AND '$SourceFileName' LIKE REPLACE(FilePattern, '*', '%');
-"@
-try {
-    $TableMapping = Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $TableMappingQuery -Variable @{ SourceFileName = $SourceFileName } -TrustServerCertificate
-    if ($TableMapping.Count -eq 0) {
-        Log_Message "No table mapping found for CSV file: $SourceFileName."
-        continue
-    }
-    $PayorName = $TableMapping.PayorName
-    $TargetTable = $TableMapping.TargetTable
-    $ArchiveBasePath = $TableMapping.ArchivePath
-    Log_Message "Mapping found for file: $SourceFileName, $PayorName targeting table: $TargetTable."
-} catch {
-    Log_Message "Failed to retrieve table mapping for CSV file: $SourceFileName : $_"
-    continue
-}
-
