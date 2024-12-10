@@ -210,3 +210,23 @@ try {
     continue
 }
 
+$TableMappingQuery = @"
+SELECT PayorName, TargetTable, FilePattern, ArchivePath
+FROM $TableMappingTable
+WHERE FileType = 'CSV' AND '$SourceFileName' LIKE REPLACE(FilePattern, '*', '%');
+"@
+try {
+    $TableMapping = Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $TableMappingQuery -Variable @{ SourceFileName = $SourceFileName } -TrustServerCertificate
+    if ($TableMapping.Count -eq 0) {
+        Log_Message "No table mapping found for CSV file: $SourceFileName."
+        continue
+    }
+    $PayorName = $TableMapping.PayorName
+    $TargetTable = $TableMapping.TargetTable
+    $ArchiveBasePath = $TableMapping.ArchivePath
+    Log_Message "Mapping found for file: $SourceFileName, $PayorName targeting table: $TargetTable."
+} catch {
+    Log_Message "Failed to retrieve table mapping for CSV file: $SourceFileName : $_"
+    continue
+}
+
