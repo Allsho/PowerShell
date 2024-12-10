@@ -179,3 +179,34 @@ foreach ($File in $Files) {
 
 # Final log
 Log_Message "CSV ETL process completed for all files in folder: $FolderPath."
+
+
+
+# Load and transform CSV content
+try {
+    $CsvContent = Import-Csv -Path $FilePath -Delimiter ','
+    
+    # Check if CSV is empty or improperly formatted
+    if (-not $CsvContent -or $CsvContent.Count -eq 0) {
+        Log_Message "CSV file $FilePath is empty or has no rows. Skipping."
+        continue
+    }
+
+    # Verify headers exist
+    if (-not $CsvContent[0].PSObject.Properties.Name) {
+        Log_Message "CSV file $FilePath is improperly formatted or missing headers. Skipping."
+        continue
+    }
+
+    # Build column mapping pipeline only if CSV loaded successfully
+    $AlignedColumns = @{}
+    foreach ($Mapping in $Mappings) {
+        if ($CsvContent[0].PSObject.Properties[$Mapping.IncomingColumnName]) {
+            $AlignedColumns[$Mapping.IncomingColumnName] = $Mapping.StandardizedColumnName
+        }
+    }
+} catch {
+    Log_Message "Error processing CSV file $SourceFileName: $_"
+    continue
+}
+
