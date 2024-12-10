@@ -1,5 +1,5 @@
-# ==========================================
-# CSV ETL Script for SQL Server with Archiving
+# ========================================== 
+# CSV ETL Script for SQL Server with Archiving (Optimized)
 # ==========================================
 
 # Configuration
@@ -8,7 +8,7 @@ $Database = "ClaimsStage"                     # Database to store the data
 $FolderPath = ""                              # Directory containing CSV files to process
 $DataMappingTable = "ETL.Claim_Data_Mapping"  # Table containing column mappings
 $TableMappingTable = "ETL.Table_Mapping"      # Table mapping FilePattern to TargetTable
-$BatchSize = 100                             # Maximum number of rows to insert per query
+$BatchSize = 100                              # Maximum number of rows to insert per query
 
 # Function: Log a message to the database
 function Log_Message {
@@ -100,16 +100,12 @@ foreach ($File in $Files) {
         continue
     }
 
-    # Create mapping dictionary
-    $MappingDict = @{ }
-    foreach ($Row in $Mappings) {
-        $MappingDict[$Row.IncomingColumnName] = $Row.StandardizedColumnName
-    }
-
-    # Verify file exists
-    if (-not (Test-Path -Path $FilePath)) {
-        Log_Message "File not found: $FilePath"
-        continue
+    # Build column mapping pipeline
+    $AlignedColumns = @{}
+    foreach ($Mapping in $Mappings) {
+        if ($CsvContent[0].PSObject.Properties[$Mapping.IncomingColumnName]) {
+            $AlignedColumns[$Mapping.IncomingColumnName] = $Mapping.StandardizedColumnName
+        }
     }
 
     # Load and transform CSV content
@@ -119,6 +115,8 @@ foreach ($File in $Files) {
             Log_Message "No data in file: $FilePath"
             continue
         }
+        # Add SourceFileName to each row
+        $CsvContent | ForEach-Object { $_.SourceFileName = $SourceFileName }
         Log_Message "Loaded CSV file: $SourceFileName successfully with $($CsvContent.Count) rows."
     } catch {
         Log_Message "Failed to load CSV file: $SourceFileName : $_"
@@ -126,50 +124,29 @@ foreach ($File in $Files) {
     }
 
     # Prepare headers for insertion
-    $ColumnHeaders = ($MappingDict.Values | ForEach-Object { "[$_]" }) -join ","
+    $ColumnHeaders = ($AlignedColumns.Values | ForEach-Object { "[$_]" }) -join ","
     $RowCounter = 0
     $BatchRows = @()
 
     foreach ($Row in $CsvContent) {
-        $Values = @()
-        foreach ($IncomingColumn in $MappingDict.Keys) {
-            $MappedColumn = $MappingDict[$IncomingColumn]
-            switch ($MappedColumn) {
-                "EffectiveKey" {
-                    $Parts = $SourceFileName -split '_'
-                    $Values += $Parts[2].Substring(0, 6)
-                    Write-Host "$Values "
-                }
-                "SourceFileName" {
-                    $Values += "'$($SourceFileName -replace "'", "''")'"
-                }
-                default {
-                    $Value = $Row.$IncomingColumn -replace "'", "''"
-                    if ($Value -ne "") {
-                        $Values += "'$Value'"
-                    } else {
-                        $Values += "NULL"
-                    }
-                }
-            }
+        $Values = $AlignedColumns.Keys | ForEach-Object {
+            $Value = $Row.$_ -replace "'", "''"
+            if ($Value -ne "") { "'$Value'" } else { "NULL" }
         }
         $BatchRows += "($($Values -join ','))"
         $RowCounter++
-    
-        # Process batch when size is reached or at the end
+
         if ($RowCounter % $BatchSize -eq 0 -or $RowCounter -eq $CsvContent.Count) {
-            if ($BatchRows.Count -gt 0) {
-                $BatchInsertQuery = @"
-                INSERT INTO $TargetTable ($ColumnHeaders)
-                VALUES
-                $($BatchRows -join ",`n");
+            $BatchInsertQuery = @"
+            INSERT INTO $TargetTable ($ColumnHeaders)
+            VALUES
+            $($BatchRows -join ",`n");
 "@
-                try {
-                    Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $BatchInsertQuery -TrustServerCertificate
-                    Log_Message "Inserted batch of $($BatchRows.Count) rows for CSV file: $SourceFileName."
-                } catch {
-                    Log_Message "Failed to insert batch for file: $SourceFileName : $_"
-                }
+            try {
+                Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $BatchInsertQuery -TrustServerCertificate
+                Log_Message "Inserted batch of $($BatchRows.Count) rows for CSV file: $SourceFileName."
+            } catch {
+                Log_Message "Failed to insert batch for file: $SourceFileName : $_"
             }
             $BatchRows = @()
         }
