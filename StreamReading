@@ -57,6 +57,21 @@ foreach ($File in $Files) {
         continue
     }
 
+    # Determine archive folder path
+    $CurrentYearMonth = (Get-Date).ToString("yyyyMM")
+    $ArchivePath = Join-Path -Path $ArchiveBasePath -ChildPath $CurrentYearMonth
+
+    # Create archive folder if it doesn't exist
+    if (-not (Test-Path -Path $ArchivePath)) {
+        try {
+            New-Item -ItemType Directory -Path $ArchivePath -Force | Out-Null
+            Log_Message "Created archive folder: $ArchivePath."
+        } catch {
+            Log_Message "Failed to create archive folder: $ArchivePath : $_"
+            continue
+        }
+    }
+
     # Truncate target table
     $TruncateQuery = "TRUNCATE TABLE $TargetTable;"
     try {
@@ -104,7 +119,7 @@ foreach ($File in $Files) {
 
     $RowCounter = 0
     $BatchRows = @()
-    while (($Line = $Reader.ReadLine()) -ne $null) {
+    while ($null -ne ($Line = $Reader.ReadLine())) {
         $Row = $Line -split ','
         $Values = @()
         foreach ($IncomingColumn in $MappingDict.Keys) {
@@ -130,6 +145,7 @@ foreach ($File in $Files) {
         # Process batch when size is reached or at the end
         if ($RowCounter % $BatchSize -eq 0) {
             if ($BatchRows.Count -gt 0) {
+                Write-Host $TargetTable
                 $BatchInsertQuery = @"
                 INSERT INTO $TargetTable ($ColumnHeaders)
                 VALUES
