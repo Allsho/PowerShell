@@ -185,3 +185,71 @@ foreach ($File in $Files) {
 
 # Final log
 Log_Message "CSV ETL process completed for all files in folder: $FolderPath."
+
+
+
+# Optimized Streaming and Writing Section
+$Reader = [System.IO.File]::OpenText($FilePath)
+$HeaderLine = $Reader.ReadLine()
+$Headers = ($HeaderLine -split ',') -replace '"',''
+
+# Initialize StringBuilder for Batch Insert
+$StringBuilder = New-Object -TypeName System.Text.StringBuilder
+$RowCounter = 0
+
+while ($null -ne ($Line = $Reader.ReadLine())) {
+    $Row = $Line -split ',' -replace '"', ''  # Pre-clean the row
+    $Values = @()
+
+    foreach ($IncomingColumn in $MappingDict.Keys) {
+        $Index = [Array]::IndexOf($Headers, $IncomingColumn)
+        $MappedColumn = $MappingDict[$IncomingColumn]
+        $Value = if ($Index -ge 0) { $Row[$Index] -replace "'", "''" } else { "NULL" }
+        switch ($MappedColumn) {
+            "EffectiveKey" {
+                $Parts = $SourceFileName -split '_'
+                $Values += $Parts[2].Substring(0, 6)
+            }
+            "SourceFileName" {
+                $Values += "'$($SourceFileName -replace "'", "''")'"
+            }
+            default {
+                $Values += if ($Value -ne "") { "'$Value'" } else { "NULL" }
+            }
+        }
+    }
+
+    $StringBuilder.Append("($($Values -join ','))`n") | Out-Null
+    $RowCounter++
+
+    if ($RowCounter % $BatchSize -eq 0) {
+        $BatchInsertQuery = @"
+        INSERT INTO $TargetTable ($ColumnHeaders)
+        VALUES
+        $($StringBuilder.ToString());
+"@
+        try {
+            Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $BatchInsertQuery -TrustServerCertificate
+            Log_Message "Inserted batch of $BatchSize rows for CSV file: $SourceFileName."
+        } catch {
+            Log_Message "Failed to insert batch for file: $SourceFileName : $_"
+        }
+        $StringBuilder.Clear() | Out-Null  # Clear for next batch
+    }
+}
+$Reader.Close()
+
+# Insert any remaining rows
+if ($StringBuilder.Length -gt 0) {
+    $BatchInsertQuery = @"
+    INSERT INTO $TargetTable ($ColumnHeaders)
+    VALUES
+    $($StringBuilder.ToString());
+"@
+    try {
+        Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $BatchInsertQuery -TrustServerCertificate
+        Log_Message "Inserted remaining rows for CSV file: $SourceFileName."
+    } catch {
+        Log_Message "Failed to insert remaining rows for file: $SourceFileName : $_"
+    }
+}
