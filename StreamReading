@@ -106,6 +106,9 @@ foreach ($File in $Files) {
         $MappingDict[$Row.IncomingColumnName] = $Row.StandardizedColumnName
     }
 
+    # Generate column headers for the INSERT Query, wrapping them in square brackets
+    $ColumnHeaders = ($MappingDict.Values | ForEach-Object { "[$_]" }) -join ","
+
     # Verify file exists
     if (-not (Test-Path -Path $FilePath)) {
         Log_Message "File not found: $FilePath"
@@ -115,12 +118,20 @@ foreach ($File in $Files) {
     # Load CSV file as stream and process rows
     $Reader = [System.IO.File]::OpenText($FilePath)
     $HeaderLine = $Reader.ReadLine()
-    $Headers = $HeaderLine -split ','
+    $Headers = ($HeaderLine -split ',') -replace '"',''
+
+    #Write-Host "Mapping Dict Keys: $($MappingDict.Keys -join ',')"
+    #Write-Host "Mapping Dict Values: $($MappingDict.Values -join ',')"
+    #Write-Host "CSV Headers: $($Headers -join ',')"
 
     $RowCounter = 0
     $BatchRows = @()
     while ($null -ne ($Line = $Reader.ReadLine())) {
+        #Write-Host $Line
         $Row = $Line -split ','
+
+        # Remove double quotes from each value in the row
+        $Row = $Row -replace '"', ''
         $Values = @()
         foreach ($IncomingColumn in $MappingDict.Keys) {
             $Index = [Array]::IndexOf($Headers, $IncomingColumn)
@@ -145,7 +156,6 @@ foreach ($File in $Files) {
         # Process batch when size is reached or at the end
         if ($RowCounter % $BatchSize -eq 0) {
             if ($BatchRows.Count -gt 0) {
-                Write-Host $TargetTable
                 $BatchInsertQuery = @"
                 INSERT INTO $TargetTable ($ColumnHeaders)
                 VALUES
