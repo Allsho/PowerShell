@@ -71,6 +71,16 @@ foreach ($File in $Files) {
         }
     }
 
+    # Truncate target table
+    $TruncateQuery = "TRUNCATE TABLE $TargetTable;"
+    try {
+        Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $TruncateQuery -TrustServerCertificate
+        Log_Message "Staging table $TargetTable truncated successfully."
+    } catch {
+        Log_Message "Failed to truncate table $TargetTable : $_"
+        continue
+    }
+
     # Fetch column mappings
     $MappingQuery = @"
     SELECT IncomingColumnName, StandardizedColumnName
@@ -95,19 +105,41 @@ foreach ($File in $Files) {
         $DataTable.Columns.Add($Column) | Out-Null
     }
 
+
+    # Add a column for SourceFileName
+    #$DataTable.Columns.Add("SourceFileName") | Out-Null
+
     # Read CSV and populate DataTable
     try {
         $CsvLines = Get-Content -Path $FilePath | Select-Object -Skip 1
+        Write-Host $CsvLines
+        if (-not $CsvLines) {
+            Write-Host "The CSV file is empty or does not contain valid data: $SourceFileName."
+            continue
+        }
         foreach ($Line in $CsvLines) {
             $Row = $DataTable.NewRow()
             $Values = $Line -split ','
+
+            if (-not $Values) {
+                Write-Host "Line splitting failed or returned no values for line: $Line in file: $SourceFileName."
+                continue
+            }
 
             foreach ($Mapping in $Mappings) {
                 $IncomingColumn = $Mapping.IncomingColumnName
                 $StandardizedColumn = $Mapping.StandardizedColumnName
                 $Index = [Array]::IndexOf($Mappings.IncomingColumnName, $IncomingColumn)
-                $Row[$StandardizedColumn] = if ($Index -ge 0) { $Values[$Index].Trim() } else { [DBNull]::Value }
+
+                if ($Index -ge 0) {
+                    $Row[$StandardizedColumn] = $Values[$Index].Trim()
+                } else {
+                    $Row[$StandardizedColumn] = [DBNull]::Value
+                }
             }
+
+            # Assign SourceFileName to each row
+            $Row["SourceFileName"] = $SourceFileName
 
             $DataTable.Rows.Add($Row)
         }
@@ -120,7 +152,7 @@ foreach ($File in $Files) {
     # Use SqlBulkCopy to insert data
     $ConnectionString = "Server=$ServerName;Database=$Database;Integrated Security=True;TrustServerCertificate=True;"
     try {
-        $SqlBulkCopy = New-Object Data.SqlClient.SqlBulkCopy($ConnectionString, [Data.SqlClient.SqlBulkCopyOptions]::KeepIdentity)
+        $SqlBulkCopy = New-Object Data.SqlClient.SqlBulkCopy($ConnectionString, [Data.SqlClA1ient.SqlBulkCopyOptions]::KeepIdentity)
         $SqlBulkCopy.DestinationTableName = $TargetTable
         $SqlBulkCopy.BatchSize = 10000
 
@@ -149,42 +181,3 @@ foreach ($File in $Files) {
 
 # Final log
 Log_Message "CSV ETL process completed for all files in folder: $FolderPath."
-
-# Read CSV and populate DataTable
-try {
-    $CsvLines = Get-Content -Path $FilePath | Select-Object -Skip 1
-    if (-not $CsvLines) {
-        Log_Message "The CSV file is empty or does not contain valid data: $SourceFileName."
-        continue
-    }
-    foreach ($Line in $CsvLines) {
-        $Row = $DataTable.NewRow()
-        $Values = $Line -split ','
-
-        if (-not $Values) {
-            Log_Message "Line splitting failed or returned no values for line: $Line in file: $SourceFileName."
-            continue
-        }
-
-        foreach ($Mapping in $Mappings) {
-            $IncomingColumn = $Mapping.IncomingColumnName
-            $StandardizedColumn = $Mapping.StandardizedColumnName
-            $Index = [Array]::IndexOf($Mappings.IncomingColumnName, $IncomingColumn)
-
-            if ($Index -ge 0) {
-                $Row[$StandardizedColumn] = $Values[$Index].Trim()
-            } else {
-                $Row[$StandardizedColumn] = [DBNull]::Value
-            }
-        }
-
-        # Assign SourceFileName to each row
-        $Row["SourceFileName"] = $SourceFileName
-
-        $DataTable.Rows.Add($Row)
-    }
-    Log_Message "CSV data loaded into DataTable for file: $SourceFileName."
-} catch {
-    Log_Message "Failed to process CSV file: $SourceFileName : $_"
-    continue
-}
