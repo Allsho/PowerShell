@@ -181,3 +181,61 @@ foreach ($File in $Files) {
 
 # Final log
 Log_Message "CSV ETL process completed for all files in folder: $FolderPath."
+
+
+# Read CSV and populate DataTable
+try {
+    # Read CSV content, skipping the header line
+    $CsvLines = Get-Content -Path $FilePath | Select-Object -Skip 1
+    Write-Host "Lines read from CSV: $CsvLines.Count"  # Log number of lines read
+
+    if (-not $CsvLines) {
+        Log_Message "The CSV file is empty or does not contain valid data: $SourceFileName."
+        continue
+    }
+
+    foreach ($Line in $CsvLines) {
+        # Log the current line being processed
+        Write-Host "Processing line: $Line"
+        
+        # Initialize a new row for the DataTable
+        $Row = $DataTable.NewRow()
+
+        # Split the line into values
+        $Values = $Line -split ','
+        if (-not $Values) {
+            Log_Message "Line splitting failed or returned no values for line: $Line in file: $SourceFileName."
+            continue
+        }
+
+        # Populate the DataTable row based on column mappings
+        foreach ($Mapping in $Mappings) {
+            $IncomingColumn = $Mapping.IncomingColumnName
+            $StandardizedColumn = $Mapping.StandardizedColumnName
+            
+            # Find index of the column in the incoming data
+            $Index = [Array]::IndexOf($Mappings.IncomingColumnName, $IncomingColumn)
+            if ($Index -ge 0 -and $Index -lt $Values.Count) {
+                $Value = $Values[$Index].Trim()
+                Write-Host "Mapping: $IncomingColumn -> $StandardizedColumn, Value: $Value"
+                $Row[$StandardizedColumn] = $Value
+            } else {
+                Write-Host "Column not found or index out of range: $IncomingColumn (Index: $Index)"
+                $Row[$StandardizedColumn] = [DBNull]::Value
+            }
+        }
+
+        # Assign SourceFileName to each row
+        $Row["SourceFileName"] = $SourceFileName
+        Write-Host "Row populated: $Row"
+
+        # Add the row to the DataTable
+        $DataTable.Rows.Add($Row)
+    }
+
+    Log_Message "CSV data successfully loaded into DataTable for file: $SourceFileName."
+} catch {
+    Log_Message "Exception occurred while processing CSV file: $SourceFileName : $_"
+    Write-Host "Error processing CSV file: $_" -ForegroundColor Red
+    continue
+}
