@@ -3,9 +3,9 @@
 # ==========================================
 
 # Configuration
-$ServerName = ""                              # SQL Server name or IP address
+$ServerName = "EDWPRDSQLRSC"                              # SQL Server name or IP address
 $Database = "ClaimsStage"                     # Database to store the data
-$FolderPath = ""                              # Directory containing CSV files to process
+$FolderPath = "H:\Testing\helix_Landing_Test\Claims\YM_Medicaid\InProcess\"                              # Directory containing CSV files to process
 $DataMappingTable = "ETL.Claim_Data_Mapping"  # Table containing column mappings
 $TableMappingTable = "ETL.Table_Mapping"      # Table mapping FilePattern to TargetTable
 
@@ -105,13 +105,21 @@ foreach ($File in $Files) {
     foreach ($Mapping in $Mappings) {
         $IncomingColumn = $Mapping.IncomingColumnName
         $StandardizedColumn = $Mapping.StandardizedColumnName
-        $Index = [Array]::IndexOf($Header, $IncomingColumn)
-        if ($Index -ge 0) {
-            $ColumnIndexMap[$StandardizedColumn] = $Index
-        } else {
-            Log_Message "Column not found in header: $IncomingColumn"
+
+        try {
+            $Index = [Array]::IndexOf($Header, $IncomingColumn)
+            if ($Index -ge 0) {
+                $ColumnIndexMap[$StandardizedColumn] = $Index
+            } else {
+                Log_Message "Column not found in header: $IncomingColumn"
+            }
+        } catch {
+            Log_Message "Error mapping column $IncomingColumn for file $SourceFileName - $_ "
         }
     }
+
+    # Add SourceFileName Manually
+    $ColumnIndexMap["SourceFileName"] = $SourceFileName
 
     # Use SqlBulkCopy to stream rows into the database
     $ConnectionString = "Server=$ServerName;Database=$Database;Integrated Security=True;TrustServerCertificate=True;"
@@ -131,12 +139,16 @@ foreach ($File in $Files) {
             # Skip the header row
             $Stream.ReadLine() | Out-Null
 
-            while (($Line = $Stream.ReadLine()) -ne $null) {
+            while (null -ne ($Line = $Stream.ReadLine())) {
                 $Values = $Line -split ',' | ForEach-Object { $_.Trim('"') }
-                $Row = @{}
+                $Row = @{
+                    SourceFileName = $SourceFileName
+                }
                 foreach ($Key in $ColumnIndexMap.Keys) {
-                    $Index = $ColumnIndexMap[$Key]
-                    $Row[$Key] = if ($Index -lt $Values.Count) { $Values[$Index] } else { $null }
+                    if ($Key -ne "SourceFileName") {
+                        $Index = $ColumnIndexMap[$Key]
+                        $Row[$Key] = if ($Index -lt $Values.Count) { $Values[$Index] } else { $null }
+                    }
                 }
                 $SqlBulkCopy.WriteToServer(@($Row))
             }
