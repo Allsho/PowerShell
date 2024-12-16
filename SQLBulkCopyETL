@@ -5,7 +5,8 @@
 # Configuration
 $ServerName = ""                              # SQL Server name or IP address
 $Database = "ClaimsStage"                     # Database to store the data
-$FolderPath = ""                              # Directory containing CSV files to process
+$FolderPath = ""                              # Directory containing files to process
+$ProcessedFolderPath = ""                     # Directory to move processed files
 $DataMappingTable = "ETL.Claim_Data_Mapping"  # Table containing column mappings
 $TableMappingTable = "ETL.Table_Mapping"      # Table mapping FilePattern to TargetTable
 
@@ -24,6 +25,17 @@ function Log_Message {
     }
 }
 
+# Ensure the processed folder exists
+if (-not (Test-Path -Path $ProcessedFolderPath)) {
+    try {
+        New-Item -ItemType Directory -Path $ProcessedFolderPath -Force | Out-Null
+        Log_Message "Created processed folder: $ProcessedFolderPath."
+    } catch {
+        Log_Message "Failed to create processed folder: $ProcessedFolderPath : $_"
+        exit
+    }
+}
+
 # Process files in the folder
 $Files = Get-ChildItem -Path $FolderPath -Filter "*.csv"
 if ($Files.Count -eq 0) {
@@ -34,6 +46,12 @@ if ($Files.Count -eq 0) {
 foreach ($File in $Files) {
     $FilePath = $File.FullName
     $SourceFileName = $File.Name
+
+    # Skip files that don't exist
+    if (-not (Test-Path -Path $FilePath)) {
+        Log_Message "File not found: $SourceFileName. Skipping."
+        continue
+    }
 
     # Fetch table mapping for CSV files only
     $TableMappingQuery = @"
@@ -53,31 +71,6 @@ foreach ($File in $Files) {
         Log_Message "Mapping found for file: $SourceFileName, $PayorName targeting table: $TargetTable."
     } catch {
         Log_Message "Failed to retrieve table mapping for CSV file: $SourceFileName : $_"
-        continue
-    }
-
-    # Determine archive folder path
-    $CurrentYearMonth = (Get-Date).ToString("yyyyMM")
-    $ArchivePath = Join-Path -Path $ArchiveBasePath -ChildPath $CurrentYearMonth
-
-    # Create archive folder if it doesn't exist
-    if (-not (Test-Path -Path $ArchivePath)) {
-        try {
-            New-Item -ItemType Directory -Path $ArchivePath -Force | Out-Null
-            Log_Message "Created archive folder: $ArchivePath."
-        } catch {
-            Log_Message "Failed to create archive folder: $ArchivePath : $_"
-            continue
-        }
-    }
-
-    # Truncate target table
-    $TruncateQuery = "TRUNCATE TABLE $TargetTable;"
-    try {
-        Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $TruncateQuery -TrustServerCertificate
-        Log_Message "Staging table $TargetTable truncated successfully."
-    } catch {
-        Log_Message "Failed to truncate table $TargetTable : $_"
         continue
     }
 
@@ -141,14 +134,10 @@ foreach ($File in $Files) {
 
             while (null -ne ($Line = $Stream.ReadLine())) {
                 $Values = $Line -split ',' | ForEach-Object { $_.Trim('"') }
-                $Row = @{
-                    SourceFileName = $SourceFileName
-                }
+                $Row = @{}
                 foreach ($Key in $ColumnIndexMap.Keys) {
-                    if ($Key -ne "SourceFileName") {
-                        $Index = $ColumnIndexMap[$Key]
-                        $Row[$Key] = if ($Index -lt $Values.Count) { $Values[$Index] } else { $null }
-                    }
+                    $Index = $ColumnIndexMap[$Key]
+                    $Row[$Key] = if ($Index -lt $Values.Count) { $Values[$Index] } else { $null }
                 }
                 $SqlBulkCopy.WriteToServer(@($Row))
             }
@@ -164,15 +153,15 @@ foreach ($File in $Files) {
         $SqlBulkCopy.Close()
     }
 
-    # Archive the file
-    $ArchiveFilePath = Join-Path -Path $ArchivePath -ChildPath $SourceFileName
+    # Move file to processed folder
+    $ProcessedFilePath = Join-Path -Path $ProcessedFolderPath -ChildPath $SourceFileName
     try {
-        Move-Item -Path $FilePath -Destination $ArchiveFilePath -Force
-        Log_Message "File archived successfully to: $ArchiveFilePath."
+        Move-Item -Path $FilePath -Destination $ProcessedFilePath -Force
+        Log_Message "File moved successfully to processed folder: $ProcessedFilePath."
     } catch {
-        Log_Message "Failed to archive file: $SourceFileName to $ArchiveFilePath : $_"
+        Log_Message "Failed to move file to processed folder: $SourceFileName : $_"
     }
 }
 
 # Final log
-Log_Message "CSV ETL process completed for all files in folder: $FolderPath."
+Log_Message "ETL process completed for all files in folder: $FolderPath."
