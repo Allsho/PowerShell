@@ -3,9 +3,9 @@
 # ==========================================
 
 # Configuration
-$ServerName = "EDWPRDSQLRSC"                              # SQL Server name or IP address
+$ServerName = ""                              # SQL Server name or IP address
 $Database = "ClaimsStage"                     # Database to store the data
-$FolderPath = "H:\Testing\helix_Landing_Test\Claims\YM_Medicaid\InProcess\"                              # Directory containing CSV files to process
+$FolderPath = ""                              # Directory containing CSV files to process
 $DataMappingTable = "ETL.Claim_Data_Mapping"  # Table containing column mappings
 $TableMappingTable = "ETL.Table_Mapping"      # Table mapping FilePattern to TargetTable
 
