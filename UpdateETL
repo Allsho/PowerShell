@@ -1,5 +1,5 @@
 # ==========================================
-# CSV ETL Script for SQL Server with Archiving (Optimized for Large Files)
+# CSV ETL Script for SQL Server with SQL Bulk Copy and Archiving
 # ==========================================
 
 # Configuration
@@ -8,7 +8,7 @@ $Database = "ClaimsStage"                     # Database to store the data
 $FolderPath = ""                              # Directory containing CSV files to process
 $DataMappingTable = "ETL.Claim_Data_Mapping"  # Table containing column mappings
 $TableMappingTable = "ETL.Table_Mapping"      # Table mapping FilePattern to TargetTable
-$BatchSize = 1000                             # Maximum number of rows to insert per query
+$BatchSize = 1000                             # Maximum number of rows to insert per batch
 
 # Function: Log a message to the database
 function Log_Message {
@@ -36,7 +36,7 @@ foreach ($File in $Files) {
     $FilePath = $File.FullName
     $SourceFileName = $File.Name
 
-    # Fetch table mapping for CSV files only
+    # Fetch table mapping for CSV files
     $TableMappingQuery = @"
     SELECT PayorName, TargetTable, FilePattern, ArchivePath
     FROM $TableMappingTable
@@ -55,21 +55,6 @@ foreach ($File in $Files) {
     } catch {
         Log_Message "Failed to retrieve table mapping for CSV file: $SourceFileName : $_"
         continue
-    }
-
-    # Determine archive folder path
-    $CurrentYearMonth = (Get-Date).ToString("yyyyMM")
-    $ArchivePath = Join-Path -Path $ArchiveBasePath -ChildPath $CurrentYearMonth
-
-    # Create archive folder if it doesn't exist
-    if (-not (Test-Path -Path $ArchivePath)) {
-        try {
-            New-Item -ItemType Directory -Path $ArchivePath -Force | Out-Null
-            Log_Message "Created archive folder: $ArchivePath."
-        } catch {
-            Log_Message "Failed to create archive folder: $ArchivePath : $_"
-            continue
-        }
     }
 
     # Truncate target table
@@ -100,101 +85,63 @@ foreach ($File in $Files) {
         continue
     }
 
-    # Create mapping dictionary
-    $MappingDict = @{ }
-    foreach ($Row in $Mappings) {
-        $MappingDict[$Row.IncomingColumnName] = $Row.StandardizedColumnName
-    }
+    # SQL Bulk Copy Initialization
+    try {
+        $SqlConnection = New-Object System.Data.SqlClient.SqlConnection
+        $SqlConnection.ConnectionString = "Server=$ServerName;Database=$Database;Integrated Security=True;TrustServerCertificate=True;"
+        $SqlConnection.Open()
 
-    # Generate column headers for the INSERT Query, wrapping them in square brackets
-    $ColumnHeaders = ($MappingDict.Values | ForEach-Object { "[$_]" }) -join ","
+        $BulkCopy = New-Object Data.SqlClient.SqlBulkCopy($SqlConnection)
+        $BulkCopy.DestinationTableName = $TargetTable
+        $BulkCopy.BatchSize = $BatchSize
 
-    # Verify file exists
-    if (-not (Test-Path -Path $FilePath)) {
-        Log_Message "File not found: $FilePath"
+        foreach ($Mapping in $Mappings) {
+            $BulkCopy.ColumnMappings.Add($Mapping.IncomingColumnName, $Mapping.StandardizedColumnName)
+        }
+
+        # Load CSV data
+        $DataTable = New-Object System.Data.DataTable
+        $Reader = [System.IO.StreamReader]::new($FilePath)
+        $HeaderLine = $Reader.ReadLine()
+        $Headers = $HeaderLine -split ',' -replace '"', ''
+
+        # Add Columns to DataTable
+        foreach ($Header in $Headers) {
+            $Column = New-Object System.Data.DataColumn
+            $Column.ColumnName = $Header
+            $DataTable.Columns.Add($Column)
+        }
+
+        # Read rows and populate DataTable
+        while ($Reader.Peek() -ge 0) {
+            $Row = $DataTable.NewRow()
+            $Values = ($Reader.ReadLine() -split ',' -replace '"', '')
+            for ($i = 0; $i -lt $Values.Length; $i++) {
+                $Row[$i] = $Values[$i]
+            }
+            $DataTable.Rows.Add($Row)
+        }
+        $Reader.Close()
+
+        # Write to SQL Server using Bulk Copy
+        $BulkCopy.WriteToServer($DataTable)
+        Log_Message "Bulk copy completed for file: $SourceFileName."
+
+        $BulkCopy.Close()
+        $SqlConnection.Close()
+    } catch {
+        Log_Message "Failed during SQL Bulk Copy for file: $SourceFileName : $_"
         continue
     }
 
-   # Optimized Streaming and Writing Section
-    $Reader = [System.IO.File]::OpenText($FilePath)
-    $HeaderLine = $Reader.ReadLine()
-    $Headers = ($HeaderLine -split ',') -replace '"',''
-
-    # Initialize StringBuilder for Batch Insert
-    $StringBuilder = New-Object -TypeName System.Text.StringBuilder
-    $RowCounter = 0
-
-    while ($null -ne ($Line = $Reader.ReadLine())) {
-        $Row = $Line -split ',' -replace '"', ''  # Pre-clean the row
-        $Values = @()
-
-        foreach ($IncomingColumn in $MappingDict.Keys) {
-            $Index = [Array]::IndexOf($Headers, $IncomingColumn)
-            $MappedColumn = $MappingDict[$IncomingColumn]
-            $Value = if ($Index -ge 0) { $Row[$Index] -replace "'", "''" } else { "NULL" }
-            switch ($MappedColumn) {
-                "EffectiveKey" {
-                    $Parts = $SourceFileName -split '_'
-                    $Values += $Parts[2].Substring(0, 6)
-                }
-                "SourceFileName" {
-                    $Values += "'$($SourceFileName -replace "'", "''")'"
-                }
-                default {
-                    $Values += if ($Value -ne "") { "'$Value'" } else { "NULL" }
-                }
-            }
-        }
-
-        # Append each row to StringBuilder with commas between rows
-        If ($RowCounter % $BatchSize -ne 0) {
-            $StringBuilder.Append(",") | Out-Null
-        }
-
-        $StringBuilder.Append("($($Values -join ','))`n") | Out-Null
-        $RowCounter++
-
-        if ($RowCounter % $BatchSize -eq 0) {
-            $BatchInsertQuery = @"
-            INSERT INTO $TargetTable ($ColumnHeaders)
-            VALUES
-            $($StringBuilder.ToString())
-"@
-            try {
-                Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $BatchInsertQuery -TrustServerCertificate
-                Log_Message "Inserted batch of $BatchSize rows for CSV file: $SourceFileName."
-            } catch {
-                Log_Message "Failed to insert batch for file: $SourceFileName : $_"
-            }
-            $StringBuilder.Clear() | Out-Null  # Clear for next batch
-        }
-    }
-    $Reader.Close()
-
-    # Insert any remaining rows
-    if ($StringBuilder.Length -gt 0) {
-        $BatchInsertQuery = @"
-
-        INSERT INTO $TargetTable ($ColumnHeaders)
-        VALUES
-        $($StringBuilder.ToString());
-"@
-        try {
-            Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $BatchInsertQuery -TrustServerCertificate
-            Log_Message "Inserted remaining rows for CSV file: $SourceFileName."
-        } catch {
-            Log_Message "Failed to insert remaining rows for file: $SourceFileName : $_"
-        }
-    }
-
     # Archive the file
-    $ArchiveFilePath = Join-Path -Path $ArchivePath -ChildPath $SourceFileName
-    try {
-        Move-Item -Path $FilePath -Destination $ArchiveFilePath -Force
-        Log_Message "File archived successfully to: $ArchiveFilePath."
-    } catch {
-        Log_Message "Failed to archive file: $SourceFileName to $ArchiveFilePath : $_"
+    $ArchivePath = Join-Path -Path $ArchiveBasePath -ChildPath (Get-Date -Format "yyyyMM")
+    if (-not (Test-Path -Path $ArchivePath)) {
+        New-Item -ItemType Directory -Path $ArchivePath | Out-Null
     }
+    $ArchiveFilePath = Join-Path -Path $ArchivePath -ChildPath $SourceFileName
+    Move-Item -Path $FilePath -Destination $ArchiveFilePath -Force
+    Log_Message "File archived successfully to: $ArchiveFilePath."
 }
 
 # Final log
