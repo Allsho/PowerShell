@@ -1,14 +1,13 @@
 # ==========================================
-# CSV ETL Script for SQL Server with Archiving
+# Optimized CSV ETL Script for SQL Server
 # ==========================================
 
 # Configuration
 $ServerName = ""                              # SQL Server name or IP address
 $Database = "ClaimsStage"                     # Database to store the data
-$FolderPath = ""                              # Directory containing CSV files to process
+$FolderPath = ""                              # Directory containing files to process
 $DataMappingTable = "ETL.Claim_Data_Mapping"  # Table containing column mappings
 $TableMappingTable = "ETL.Table_Mapping"      # Table mapping FilePattern to TargetTable
-$BatchSize = 1000                             # Maximum number of rows to insert per query
 
 # Function: Log a message to the database
 function Log_Message {
@@ -35,6 +34,12 @@ if ($Files.Count -eq 0) {
 foreach ($File in $Files) {
     $FilePath = $File.FullName
     $SourceFileName = $File.Name
+
+    # Skip files that don't exist
+    if (-not (Test-Path -Path $FilePath)) {
+        Log_Message "File not found: $SourceFileName. Skipping."
+        continue
+    }
 
     # Fetch table mapping for CSV files only
     $TableMappingQuery = @"
@@ -100,78 +105,80 @@ foreach ($File in $Files) {
         continue
     }
 
-    # Create mapping dictionary
-    $MappingDict = @{ }
-    foreach ($Row in $Mappings) {
-        $MappingDict[$Row.IncomingColumnName] = $Row.StandardizedColumnName
-    }
+    # Extract raw header
+    $RawHeader = Get-Content -Path $FilePath -TotalCount 1
+    Write-Output "Raw Header: $RawHeader"
 
-    # Verify file exists
-    if (-not (Test-Path -Path $FilePath)) {
-        Log_Message "File not found: $FilePath"
-        continue
-    }
-
-    # Load and transform CSV content
-    try {
-        $CsvContent = Import-Csv -Path $FilePath -Delimiter ',' #-Quote '"'
-        if ($CsvContent.Count -eq 0) {
-            Log_Message "No data in file: $FilePath"
-            continue
-        }
-        Log_Message "Loaded CSV file: $SourceFileName successfully with $($CsvContent.Count) rows."
-    } catch {
-        Log_Message "Failed to load CSV file: $SourceFileName : $_"
-        continue
-    }
-
-    # Prepare headers for insertion
-    $ColumnHeaders = ($MappingDict.Values | ForEach-Object { "[$_]" }) -join ","
-    $RowCounter = 0
-    $BatchRows = @()
-
-    foreach ($Row in $CsvContent) {
-        $Values = @()
-        foreach ($IncomingColumn in $MappingDict.Keys) {
-            $MappedColumn = $MappingDict[$IncomingColumn]
-            switch ($MappedColumn) {
-                "EffectiveKey" {
-                    $Parts = $SourceFileName -split '_'
-                    $Values += $Parts[2].Substring(0, 6)
-                }
-                "SourceFileName" {
-                    $Values += "'$($SourceFileName -replace "'", "''")'"
-                }
-                default {
-                    $Value = $Row.$IncomingColumn -replace "'", "''"
-                    if ($Value -ne "") {
-                        $Values += "'$Value'"
-                    } else {
-                        $Values += "NULL"
-                    }
-                }
-            }
-        }
-        $BatchRows += "($($Values -join ','))"
-        $RowCounter++
+    # Remove BOM, split by delimiter, trim spaces, and remove surrounding quotes
+    $Header = $RawHeader -replace "^\uFEFF", "" | ForEach-Object {$_.Trim(' ', '"') }
+    Write-Output "Extracted Header: $($Header -join ', ')"
     
-        # Process batch when size is reached or at the end
-        if ($RowCounter % $BatchSize -eq 0 -or $RowCounter -eq $CsvContent.Count) {
-            if ($BatchRows.Count -gt 0) {
-                $BatchInsertQuery = @"
-                INSERT INTO $TargetTable ($ColumnHeaders)
-                VALUES
-                $($BatchRows -join ",`n");
-"@
-                try {
-                    Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $BatchInsertQuery -TrustServerCertificate
-                    Log_Message "Inserted batch of $($BatchRows.Count) rows for CSV file: $SourceFileName."
-                } catch {
-                    Log_Message "Failed to insert batch for file: $SourceFileName : $_"
-                }
+    # Validate header
+    if (-not $Header -or $Header.Count -eq 0) {
+        Log_Message "Failed to read header from file: $FilePath"
+        continue
+    }
+    
+    # Pre-compute column indices based on header
+    $ColumnIndexMap = @{}
+    foreach ($Mapping in $Mappings) {
+        $IncomingColumn = $Mapping.IncomingColumnName
+        $StandardizedColumn = $Mapping.StandardizedColumnName
+
+        Write-Host "Looking for column: $IncomingColumn in header: $($Header -join ', ')"
+
+        try {
+            $Index = [Array]::IndexOf($Header, $IncomingColumn)
+            if ($Index -ge 0) {
+                $ColumnIndexMap[$StandardizedColumn] = $Index
+            } else {
+                Log_Message "Column not found in header: $IncomingColumn"
             }
-            $BatchRows = @()
+        } catch {
+            Log_Message "Error mapping column $IncomingColumn for file $SourceFileName - $_ "
         }
+    }
+
+    # Add SourceFileName Manually
+    $ColumnIndexMap["SourceFileName"] = $SourceFileName
+
+    # Use SqlBulkCopy to stream rows into the database
+    $ConnectionString = "Server=$ServerName;Database=$Database;Integrated Security=True;TrustServerCertificate=True;"
+    try {
+        $SqlBulkCopy = New-Object Data.SqlClient.SqlBulkCopy($ConnectionString, [Data.SqlClient.SqlBulkCopyOptions]::KeepIdentity)
+        $SqlBulkCopy.DestinationTableName = $TargetTable
+        $SqlBulkCopy.BatchSize = 10000
+
+        # Map columns
+        foreach ($Key in $ColumnIndexMap.Keys) {
+            $SqlBulkCopy.ColumnMappings.Add($Key, $Key) | Out-Null
+        }
+
+        # Stream CSV rows and populate SqlBulkCopy
+        $Stream = New-Object System.IO.StreamReader($FilePath)
+        try {
+            # Skip the header row
+            $Stream.ReadLine() | Out-Null
+
+            while (null -ne ($Line = $Stream.ReadLine())) {
+                $Values = $Line -split ',' | ForEach-Object { $_.Trim('"') }
+                $Row = @{}
+                foreach ($Key in $ColumnIndexMap.Keys) {
+                    $Index = $ColumnIndexMap[$Key]
+                    $Row[$Key] = if ($Index -lt $Values.Count) { $Values[$Index] } else { $null }
+                }
+                $SqlBulkCopy.WriteToServer(@($Row))
+            }
+        } finally {
+            $Stream.Close()
+        }
+
+        Log_Message "Data successfully inserted into $TargetTable using SqlBulkCopy."
+    } catch {
+        Log_Message "Failed to bulk insert data for file: $SourceFileName : $_"
+        continue
+    } finally {
+        $SqlBulkCopy.Close()
     }
 
     # Archive the file
@@ -182,7 +189,6 @@ foreach ($File in $Files) {
     } catch {
         Log_Message "Failed to archive file: $SourceFileName to $ArchiveFilePath : $_"
     }
-}
 
 # Final log
-Log_Message "CSV ETL process completed for all files in folder: $FolderPath."
+Log_Message "ETL process completed for all files in folder: $FolderPath."
