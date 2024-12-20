@@ -5,10 +5,10 @@
 # Configuration
 $ServerName = ""                              # SQL Server name or IP address
 $Database = "ClaimsStage"                     # Database to store the data
-$FolderPath = ""                              # Directory containing CSV files to process
+$FolderPath = ""                              # Directory containing files to process
 $DataMappingTable = "ETL.Claim_Data_Mapping"  # Table containing column mappings
 $TableMappingTable = "ETL.Table_Mapping"      # Table mapping FilePattern to TargetTable
-$BatchSize = 1000                             # Maximum number of rows to insert per batch
+$BatchSize = 1000    
 
 # Function: Log a message to the database
 function Log_Message {
@@ -96,7 +96,12 @@ foreach ($File in $Files) {
         $BulkCopy.BatchSize = $BatchSize
 
         foreach ($Mapping in $Mappings) {
-            $BulkCopy.ColumnMappings.Add($Mapping.IncomingColumnName, $Mapping.StandardizedColumnName)
+            try {
+                $BulkCopy.ColumnMappings.Add($Mapping.IncomingColumnName, $Mapping.StandardizedColumnName)
+                #Log_Message "Mapping added for: $($Mapping.IncomingColumnName) -> $($Mapping.StandardizedColumnName)"
+            } catch {
+                #Log_Message "Mapping failed for: $($Mapping.IncomingColumnName) -> $($Mapping.StandardizedColumnName): $_"
+            }
         }
 
         # Load CSV data
@@ -105,7 +110,24 @@ foreach ($File in $Files) {
         $HeaderLine = $Reader.ReadLine()
         $Headers = $HeaderLine -split ',' -replace '"', ''
 
-        # Add Columns to DataTable
+        # Debugging
+        <#
+        Log_Message "CSV Headers: $($Headers -join ', ')"
+        foreach ($Mapping in $Mappings) {
+            Log_Message "Mapping: Incoming=$($Mapping.IncomingColumnName), Standardized=$($Mapping.StandardizedColumnName)"
+        }
+        #>
+
+        Add-Type -AssemblyName 'Microsoft.VisualBasic'
+
+        # Load CSV data
+        $DataTable = New-Object System.Data.DataTable
+        $TextFieldParser = New-Object Microsoft.VisualBasic.FileIO.TextFieldParser($FilePath)
+        $TextFieldParser.TextFieldType = [Microsoft.VisualBasic.FileIO.FieldType]::Delimited
+        $TextFieldParser.SetDelimiters(',')
+
+        # Read headers
+        $Headers = $TextFieldParser.ReadFields()
         foreach ($Header in $Headers) {
             $Column = New-Object System.Data.DataColumn
             $Column.ColumnName = $Header
@@ -113,15 +135,23 @@ foreach ($File in $Files) {
         }
 
         # Read rows and populate DataTable
-        while ($Reader.Peek() -ge 0) {
+        while (-not $TextFieldParser.EndOfData) {
+            $Fields = $TextFieldParser.ReadFields()
+
+            # Check if the row matches the number of headers
+            if ($Fields.Length -ne $Headers.Length) {
+                Log_Message "Row mismatch: Expected $($Headers.Length), got $($Fields.Length). Row: $($Fields -join ', ')"
+                continue  # Skip problematic row
+            }
+
             $Row = $DataTable.NewRow()
-            $Values = ($Reader.ReadLine() -split ',' -replace '"', '')
-            for ($i = 0; $i -lt $Values.Length; $i++) {
-                $Row[$i] = $Values[$i]
+            for ($i = 0; $i -lt $Fields.Length; $i++) {
+                $Row[$i] = $Fields[$i]
             }
             $DataTable.Rows.Add($Row)
         }
-        $Reader.Close()
+
+        $TextFieldParser.Close()
 
         # Write to SQL Server using Bulk Copy
         $BulkCopy.WriteToServer($DataTable)
@@ -131,7 +161,6 @@ foreach ($File in $Files) {
         $SqlConnection.Close()
     } catch {
         Log_Message "Failed during SQL Bulk Copy for file: $SourceFileName : $_"
-        Log_Message $Header
         continue
     }
 
@@ -147,41 +176,3 @@ foreach ($File in $Files) {
 
 # Final log
 Log_Message "CSV ETL process completed for all files in folder: $FolderPath."
-
-Add-Type -AssemblyName 'Microsoft.VisualBasic'
-
-# Load CSV data
-$DataTable = New-Object System.Data.DataTable
-$TextFieldParser = New-Object Microsoft.VisualBasic.FileIO.TextFieldParser($FilePath)
-$TextFieldParser.TextFieldType = [Microsoft.VisualBasic.FileIO.FieldType]::Delimited
-$TextFieldParser.SetDelimiters(',')
-
-# Read headers
-$Headers = $TextFieldParser.ReadFields()
-foreach ($Header in $Headers) {
-    $Column = New-Object System.Data.DataColumn
-    $Column.ColumnName = $Header
-    $DataTable.Columns.Add($Column)
-}
-
-# Read rows and populate DataTable
-while (-not $TextFieldParser.EndOfData) {
-    $Fields = $TextFieldParser.ReadFields()
-
-    # Check if the row matches the number of headers
-    if ($Fields.Length -ne $Headers.Length) {
-        Log_Message "Row mismatch: Expected $($Headers.Length), got $($Fields.Length). Row: $($Fields -join ', ')"
-        continue  # Skip problematic row
-    }
-
-    $Row = $DataTable.NewRow()
-    for ($i = 0; $i -lt $Fields.Length; $i++) {
-        $Row[$i] = $Fields[$i]
-    }
-    $DataTable.Rows.Add($Row)
-}
-
-$TextFieldParser.Close()
-
-
-
