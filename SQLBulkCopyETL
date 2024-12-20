@@ -148,17 +148,40 @@ foreach ($File in $Files) {
 # Final log
 Log_Message "CSV ETL process completed for all files in folder: $FolderPath."
 
-while ($Reader.Peek() -ge 0) {
-    $Values = ($Reader.ReadLine() -split ',' -replace '"', '')
-    if ($Values.Length -ne $Headers.Length) {
-        Log_Message "Row structure mismatch at row $($DataTable.Rows.Count + 1). Skipping row."
-        continue
+Add-Type -AssemblyName 'Microsoft.VisualBasic'
+
+# Load CSV data
+$DataTable = New-Object System.Data.DataTable
+$TextFieldParser = New-Object Microsoft.VisualBasic.FileIO.TextFieldParser($FilePath)
+$TextFieldParser.TextFieldType = [Microsoft.VisualBasic.FileIO.FieldType]::Delimited
+$TextFieldParser.SetDelimiters(',')
+
+# Read headers
+$Headers = $TextFieldParser.ReadFields()
+foreach ($Header in $Headers) {
+    $Column = New-Object System.Data.DataColumn
+    $Column.ColumnName = $Header
+    $DataTable.Columns.Add($Column)
+}
+
+# Read rows and populate DataTable
+while (-not $TextFieldParser.EndOfData) {
+    $Fields = $TextFieldParser.ReadFields()
+
+    # Check if the row matches the number of headers
+    if ($Fields.Length -ne $Headers.Length) {
+        Log_Message "Row mismatch: Expected $($Headers.Length), got $($Fields.Length). Row: $($Fields -join ', ')"
+        continue  # Skip problematic row
     }
+
     $Row = $DataTable.NewRow()
-    for ($i = 0; $i -lt $Values.Length; $i++) {
-        $Row[$i] = $Values[$i]
+    for ($i = 0; $i -lt $Fields.Length; $i++) {
+        $Row[$i] = $Fields[$i]
     }
     $DataTable.Rows.Add($Row)
 }
+
+$TextFieldParser.Close()
+
 
 
