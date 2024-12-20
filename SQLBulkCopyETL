@@ -147,3 +147,20 @@ foreach ($File in $Files) {
 
 # Final log
 Log_Message "CSV ETL process completed for all files in folder: $FolderPath."
+
+# Preview Insert Statements
+try {
+    foreach ($Row in $DataTable.Rows) {
+        $Columns = $Headers -join ", "  # Join header names for column list
+        $Values = $Row.ItemArray | ForEach-Object { "'$($_.Replace("'", "''"))'" } -join ", "  # Escape single quotes and join values
+        $InsertStatement = "INSERT INTO $TargetTable ($Columns) VALUES ($Values);"
+        
+        # Log or Output the Insert Statement
+        Log_Message "Preview Insert: $InsertStatement"
+        Write-Host "Preview Insert: $InsertStatement"
+    }
+} catch {
+    Log_Message "Failed to generate INSERT statement for preview: $_"
+    continue
+}
+
