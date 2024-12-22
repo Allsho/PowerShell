@@ -8,7 +8,8 @@ $Database = "ClaimsStage"                     # Database to store the data
 $FolderPath = ""                              # Directory containing files to process
 $DataMappingTable = "ETL.Claim_Data_Mapping"  # Table containing column mappings
 $TableMappingTable = "ETL.Table_Mapping"      # Table mapping FilePattern to TargetTable
-$BatchSize = 1000    
+$BatchSize = 1000
+Add-Type -AssemblyName 'Microsoft.VisualBasic'
 
 # Function: Log a message to the database
 function Log_Message {
@@ -36,13 +37,13 @@ foreach ($File in $Files) {
     $FilePath = $File.FullName
     $SourceFileName = $File.Name
 
-    # Fetch table mapping for CSV files
-    $TableMappingQuery = @"
-    SELECT PayorName, TargetTable, FilePattern, ArchivePath
-    FROM $TableMappingTable
-    WHERE FileType = 'CSV' AND '$SourceFileName' LIKE REPLACE(FilePattern, '*', '%');
-"@
     try {
+        # Fetch table mapping for CSV files
+        $TableMappingQuery = @"
+        SELECT PayorName, TargetTable, FilePattern, ArchivePath
+        FROM $TableMappingTable
+        WHERE FileType = 'CSV' AND '$SourceFileName' LIKE REPLACE(FilePattern, '*', '%');
+"@
         $TableMapping = Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $TableMappingQuery -TrustServerCertificate
         if ($TableMapping.Count -eq 0) {
             Log_Message "No table mapping found for CSV file: $SourceFileName."
@@ -52,41 +53,26 @@ foreach ($File in $Files) {
         $TargetTable = $TableMapping.TargetTable
         $ArchiveBasePath = $TableMapping.ArchivePath
         Log_Message "Mapping found for file: $SourceFileName, $PayorName targeting table: $TargetTable."
-    } catch {
-        Log_Message "Failed to retrieve table mapping for CSV file: $SourceFileName : $_"
-        continue
-    }
 
-    # Truncate target table
-    $TruncateQuery = "TRUNCATE TABLE $TargetTable;"
-    try {
+        # Truncate target table
+        $TruncateQuery = "TRUNCATE TABLE $TargetTable;"
         Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $TruncateQuery -TrustServerCertificate
         Log_Message "Staging table $TargetTable truncated successfully."
-    } catch {
-        Log_Message "Failed to truncate table $TargetTable : $_"
-        continue
-    }
 
-    # Fetch column mappings
-    $MappingQuery = @"
-    SELECT IncomingColumnName, StandardizedColumnName
-    FROM $DataMappingTable
-    WHERE PayorName = '$PayorName';
+        # Fetch column mappings
+        $MappingQuery = @"
+        SELECT IncomingColumnName, StandardizedColumnName
+        FROM $DataMappingTable
+        WHERE PayorName = '$PayorName';
 "@
-    try {
         $Mappings = Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $MappingQuery -TrustServerCertificate
         if ($Mappings.Count -eq 0) {
             Log_Message "No column mappings found for PayorName: $PayorName."
             continue
         }
         Log_Message "Fetched column mappings successfully for PayorName: $PayorName."
-    } catch {
-        Log_Message "Failed to retrieve column mappings: $_"
-        continue
-    }
 
-    # SQL Bulk Copy Initialization
-    try {
+        # SQL Bulk Copy Initialization
         $SqlConnection = New-Object System.Data.SqlClient.SqlConnection
         $SqlConnection.ConnectionString = "Server=$ServerName;Database=$Database;Integrated Security=True;TrustServerCertificate=True;"
         $SqlConnection.Open()
@@ -96,82 +82,61 @@ foreach ($File in $Files) {
         $BulkCopy.BatchSize = $BatchSize
 
         foreach ($Mapping in $Mappings) {
-            try {
-                $BulkCopy.ColumnMappings.Add($Mapping.IncomingColumnName, $Mapping.StandardizedColumnName)
-                #Log_Message "Mapping added for: $($Mapping.IncomingColumnName) -> $($Mapping.StandardizedColumnName)"
-            } catch {
-                #Log_Message "Mapping failed for: $($Mapping.IncomingColumnName) -> $($Mapping.StandardizedColumnName): $_"
-            }
+            $BulkCopy.ColumnMappings.Add($Mapping.IncomingColumnName, $Mapping.StandardizedColumnName)
         }
 
         # Load CSV data
-        $DataTable = New-Object System.Data.DataTable
-        $Reader = [System.IO.StreamReader]::new($FilePath)
-        $HeaderLine = $Reader.ReadLine()
-        $Headers = $HeaderLine -split ',' -replace '"', ''
-
-        # Debugging
-        <#
-        Log_Message "CSV Headers: $($Headers -join ', ')"
-        foreach ($Mapping in $Mappings) {
-            Log_Message "Mapping: Incoming=$($Mapping.IncomingColumnName), Standardized=$($Mapping.StandardizedColumnName)"
-        }
-        #>
-
-        Add-Type -AssemblyName 'Microsoft.VisualBasic'
-
-        # Load CSV data
-        $DataTable = New-Object System.Data.DataTable
         $TextFieldParser = New-Object Microsoft.VisualBasic.FileIO.TextFieldParser($FilePath)
         $TextFieldParser.TextFieldType = [Microsoft.VisualBasic.FileIO.FieldType]::Delimited
         $TextFieldParser.SetDelimiters(',')
 
-        # Read headers
         $Headers = $TextFieldParser.ReadFields()
+        $DataTable = New-Object System.Data.DataTable
+
         foreach ($Header in $Headers) {
-            $Column = New-Object System.Data.DataColumn
-            $Column.ColumnName = $Header
+            $Column = New-Object System.Data.DataColumn $Header
             $DataTable.Columns.Add($Column)
         }
 
-        # Read rows and populate DataTable
         while (-not $TextFieldParser.EndOfData) {
             $Fields = $TextFieldParser.ReadFields()
-
-            # Check if the row matches the number of headers
-            if ($Fields.Length -ne $Headers.Length) {
-                Log_Message "Row mismatch: Expected $($Headers.Length), got $($Fields.Length). Row: $($Fields -join ', ')"
-                continue  # Skip problematic row
-            }
-
             $Row = $DataTable.NewRow()
-            for ($i = 0; $i -lt $Fields.Length; $i++) {
-                $Row[$i] = $Fields[$i]
-            }
+            $Row.ItemArray = $Fields
             $DataTable.Rows.Add($Row)
         }
 
         $TextFieldParser.Close()
-
-        # Write to SQL Server using Bulk Copy
         $BulkCopy.WriteToServer($DataTable)
+
         Log_Message "Bulk copy completed for file: $SourceFileName."
 
+        # Close connections
         $BulkCopy.Close()
         $SqlConnection.Close()
-    } catch {
-        Log_Message "Failed during SQL Bulk Copy for file: $SourceFileName : $_"
-        continue
-    }
 
-    # Archive the file
-    $ArchivePath = Join-Path -Path $ArchiveBasePath -ChildPath (Get-Date -Format "yyyyMM")
-    if (-not (Test-Path -Path $ArchivePath)) {
-        New-Item -ItemType Directory -Path $ArchivePath | Out-Null
+        # Archive the file
+        $ArchivePath = Join-Path -Path $ArchiveBasePath -ChildPath (Get-Date -Format "yyyyMM")
+        if (-not (Test-Path -Path $ArchivePath)) {
+            New-Item -ItemType Directory -Path $ArchivePath | Out-Null
+        }
+        $ArchiveFilePath = Join-Path -Path $ArchivePath -ChildPath $SourceFileName
+        Move-Item -Path $FilePath -Destination $ArchiveFilePath -Force
+        Log_Message "File archived successfully to: $ArchiveFilePath."
+
+    } catch {
+        Log_Message "Error processing file $SourceFileName : $_"
+    } finally {
+        # Ensure cleanup of connections and resources
+        if ($SqlConnection.State -eq [System.Data.ConnectionState]::Open) {
+            $SqlConnection.Close()
+        }
+        if ($BulkCopy) {
+            $BulkCopy.Dispose()
+        }
+        if ($TextFieldParser) {
+            $TextFieldParser.Close()
+        }
     }
-    $ArchiveFilePath = Join-Path -Path $ArchivePath -ChildPath $SourceFileName
-    Move-Item -Path $FilePath -Destination $ArchiveFilePath -Force
-    Log_Message "File archived successfully to: $ArchiveFilePath."
 }
 
 # Final log
