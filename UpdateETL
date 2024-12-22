@@ -114,3 +114,91 @@ foreach ($File in $Files) {
 }
 
 Log_Message "N/A" "CSV ETL process completed for all files in folder: $FolderPath."
+
+
+function Process_File {
+    param ([string]$FilePath)
+
+    $SourceFileName = [System.IO.Path]::GetFileName($FilePath)
+
+    try {
+        # Fetch table mapping
+        $TableMappingQuery = @"
+        SELECT PayorName, TargetTable, FilePattern, ArchivePath
+        FROM $TableMappingTable
+        WHERE FileType = 'CSV' AND '$SourceFileName' LIKE REPLACE(FilePattern, '*', '%');
+"@
+        $TableMapping = Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $TableMappingQuery -TrustServerCertificate
+        if ($TableMapping.Count -eq 0) {
+            Log_Message "N/A" "No table mapping found for CSV file: $SourceFileName."
+            return
+        }
+        $PayorName = $TableMapping.PayorName
+        $TargetTable = $TableMapping.TargetTable
+        $ArchiveBasePath = $TableMapping.ArchivePath
+        Log_Message $PayorName "Mapping found for file: $SourceFileName targeting table: $TargetTable."
+
+        # Truncate table and get column mappings
+        Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query "TRUNCATE TABLE $TargetTable;" -TrustServerCertificate
+        $Mappings = Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query @"
+        SELECT IncomingColumnName, StandardizedColumnName
+        FROM $DataMappingTable
+        WHERE PayorName = '$PayorName';
+"@ -TrustServerCertificate
+        if ($Mappings.Count -eq 0) {
+            Log_Message $PayorName "No column mappings found for PayorName: $PayorName."
+            return
+        }
+
+        # Process CSV and Bulk Copy
+        $SqlConnection = New-Object System.Data.SqlClient.SqlConnection
+        $SqlConnection.ConnectionString = "Server=$ServerName;Database=$Database;Integrated Security=True;TrustServerCertificate=True;"
+        $SqlConnection.Open()
+
+        $BulkCopy = New-Object Data.SqlClient.SqlBulkCopy($SqlConnection)
+        $BulkCopy.DestinationTableName = $TargetTable
+        $BulkCopy.BatchSize = $BatchSize
+        foreach ($Mapping in $Mappings) {
+            $BulkCopy.ColumnMappings.Add($Mapping.IncomingColumnName, $Mapping.StandardizedColumnName)
+        }
+
+        # Convert CSV to DataTable
+        $CsvData = Import-Csv -Path $FilePath
+        $DataTable = New-Object System.Data.DataTable
+        foreach ($Column in $CsvData[0].PSObject.Properties.Name) {
+            $DataTable.Columns.Add($Column) | Out-Null
+        }
+        foreach ($Row in $CsvData) {
+            $DataRow = $DataTable.NewRow()
+            foreach ($Column in $Row.PSObject.Properties.Name) {
+                $DataRow[$Column] = $Row.$Column
+            }
+            $DataTable.Rows.Add($DataRow)
+        }
+
+        # Perform Bulk Copy
+        $BulkCopy.WriteToServer($DataTable)
+        $BulkCopy.Close()
+        $SqlConnection.Close()
+
+        # Archive the file
+        $ArchivePath = Join-Path -Path $ArchiveBasePath -ChildPath (Get-Date -Format "yyyyMM")
+        if (-not (Test-Path -Path $ArchivePath)) {
+            New-Item -ItemType Directory -Path $ArchivePath | Out-Null
+        }
+        $ArchiveFilePath = Join-Path -Path $ArchivePath -ChildPath $SourceFileName
+        Move-Item -Path $FilePath -Destination $ArchiveFilePath -Force
+        Log_Message $PayorName "File processed and archived successfully to: $ArchiveFilePath."
+
+    } catch {
+        Log_Message "N/A" "Error processing file $SourceFileName: $_"
+    } finally {
+        if ($SqlConnection.State -eq [System.Data.ConnectionState]::Open) {
+            $SqlConnection.Close()
+        }
+        if ($BulkCopy) {
+            $BulkCopy.Dispose()
+        }
+    }
+}
+
