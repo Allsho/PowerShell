@@ -2,17 +2,20 @@
 # CSV ETL Script for SQL Server with SQL Bulk Copy and Archiving
 # ==========================================
 
-# Configuration
-$ServerName = ""                              # SQL Server name or IP address
-$Database = "ClaimsStage"                     # Database to store the data
-$FolderPath = ""                              # Directory containing CSV files to process
-$DataMappingTable = "ETL.Claim_Data_Mapping"  # Table containing column mappings
-$TableMappingTable = "ETL.Table_Mapping"      # Table mapping FilePattern to TargetTable
-$BatchSize = 1000                             # Maximum number of rows to insert per batch
+# Load Configuration
+$configPath = "ETLConfig.json"
+$config = Get-Content $configPath | ConvertFrom-Json
+
+$ServerName = $config.ServerName
+$Database = $config.Database
+$FolderPath = $config.FolderPath
+$DataMappingTable = $config.DataMappingTable
+$TableMappingTable = $config.TableMappingTable
+$BatchSize = $config.BatchSize
 
 # Function: Log a message to the database
 function Log_Message {
-    param ([string]$Message)
+    param ([string]$PayorName, [string]$Message)
     $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $LogQuery = @"
     INSERT INTO ETL.Payor_Log (Timestamp, PayorName, LogMessage)
@@ -25,68 +28,42 @@ function Log_Message {
     }
 }
 
-# Process files in the folder
-$Files = Get-ChildItem -Path $FolderPath -Filter "*.csv"
-if ($Files.Count -eq 0) {
-    Write-Host "No CSV files found in folder: $FolderPath"
-    exit
-}
+# Function: Process a single file
+function Process_File {
+    param ([string]$FilePath)
 
-foreach ($File in $Files) {
-    $FilePath = $File.FullName
-    $SourceFileName = $File.Name
+    $SourceFileName = [System.IO.Path]::GetFileName($FilePath)
 
-    # Fetch table mapping for CSV files
-    $TableMappingQuery = @"
-    SELECT PayorName, TargetTable, FilePattern, ArchivePath
-    FROM $TableMappingTable
-    WHERE FileType = 'CSV' AND '$SourceFileName' LIKE REPLACE(FilePattern, '*', '%');
-"@
     try {
+        # Fetch table mapping
+        $TableMappingQuery = @"
+        SELECT PayorName, TargetTable, FilePattern, ArchivePath
+        FROM $TableMappingTable
+        WHERE FileType = 'CSV' AND '$SourceFileName' LIKE REPLACE(FilePattern, '*', '%');
+"@
         $TableMapping = Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $TableMappingQuery -TrustServerCertificate
         if ($TableMapping.Count -eq 0) {
-            Log_Message "No table mapping found for CSV file: $SourceFileName."
-            continue
+            Log_Message "N/A" "No table mapping found for CSV file: $SourceFileName."
+            return
         }
         $PayorName = $TableMapping.PayorName
         $TargetTable = $TableMapping.TargetTable
         $ArchiveBasePath = $TableMapping.ArchivePath
-        Log_Message "Mapping found for file: $SourceFileName, $PayorName targeting table: $TargetTable."
-    } catch {
-        Log_Message "Failed to retrieve table mapping for CSV file: $SourceFileName : $_"
-        continue
-    }
+        Log_Message $PayorName "Mapping found for file: $SourceFileName targeting table: $TargetTable."
 
-    # Truncate target table
-    $TruncateQuery = "TRUNCATE TABLE $TargetTable;"
-    try {
-        Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $TruncateQuery -TrustServerCertificate
-        Log_Message "Staging table $TargetTable truncated successfully."
-    } catch {
-        Log_Message "Failed to truncate table $TargetTable : $_"
-        continue
-    }
-
-    # Fetch column mappings
-    $MappingQuery = @"
-    SELECT IncomingColumnName, StandardizedColumnName
-    FROM $DataMappingTable
-    WHERE PayorName = '$PayorName';
-"@
-    try {
-        $Mappings = Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query $MappingQuery -TrustServerCertificate
+        # Truncate table and get column mappings
+        Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query "TRUNCATE TABLE $TargetTable;" -TrustServerCertificate
+        $Mappings = Invoke-SqlCmd -ServerInstance $ServerName -Database $Database -Query @"
+        SELECT IncomingColumnName, StandardizedColumnName
+        FROM $DataMappingTable
+        WHERE PayorName = '$PayorName';
+"@ -TrustServerCertificate
         if ($Mappings.Count -eq 0) {
-            Log_Message "No column mappings found for PayorName: $PayorName."
-            continue
+            Log_Message $PayorName "No column mappings found for PayorName: $PayorName."
+            return
         }
-        Log_Message "Fetched column mappings successfully for PayorName: $PayorName."
-    } catch {
-        Log_Message "Failed to retrieve column mappings: $_"
-        continue
-    }
 
-    # SQL Bulk Copy Initialization
-    try {
+        # Process CSV and Bulk Copy
         $SqlConnection = New-Object System.Data.SqlClient.SqlConnection
         $SqlConnection.ConnectionString = "Server=$ServerName;Database=$Database;Integrated Security=True;TrustServerCertificate=True;"
         $SqlConnection.Open()
@@ -94,55 +71,46 @@ foreach ($File in $Files) {
         $BulkCopy = New-Object Data.SqlClient.SqlBulkCopy($SqlConnection)
         $BulkCopy.DestinationTableName = $TargetTable
         $BulkCopy.BatchSize = $BatchSize
-
         foreach ($Mapping in $Mappings) {
             $BulkCopy.ColumnMappings.Add($Mapping.IncomingColumnName, $Mapping.StandardizedColumnName)
         }
 
-        # Load CSV data
-        $DataTable = New-Object System.Data.DataTable
-        $Reader = [System.IO.StreamReader]::new($FilePath)
-        $HeaderLine = $Reader.ReadLine()
-        $Headers = $HeaderLine -split ',' -replace '"', ''
-
-        # Add Columns to DataTable
-        foreach ($Header in $Headers) {
-            $Column = New-Object System.Data.DataColumn
-            $Column.ColumnName = $Header
-            $DataTable.Columns.Add($Column)
-        }
-
-        # Read rows and populate DataTable
-        while ($Reader.Peek() -ge 0) {
-            $Row = $DataTable.NewRow()
-            $Values = ($Reader.ReadLine() -split ',' -replace '"', '')
-            for ($i = 0; $i -lt $Values.Length; $i++) {
-                $Row[$i] = $Values[$i]
-            }
-            $DataTable.Rows.Add($Row)
-        }
-        $Reader.Close()
-
-        # Write to SQL Server using Bulk Copy
+        $DataTable = Import-Csv -Path $FilePath
         $BulkCopy.WriteToServer($DataTable)
-        Log_Message "Bulk copy completed for file: $SourceFileName."
-
         $BulkCopy.Close()
         $SqlConnection.Close()
-    } catch {
-        Log_Message "Failed during SQL Bulk Copy for file: $SourceFileName : $_"
-        continue
-    }
 
-    # Archive the file
-    $ArchivePath = Join-Path -Path $ArchiveBasePath -ChildPath (Get-Date -Format "yyyyMM")
-    if (-not (Test-Path -Path $ArchivePath)) {
-        New-Item -ItemType Directory -Path $ArchivePath | Out-Null
+        # Archive the file
+        $ArchivePath = Join-Path -Path $ArchiveBasePath -ChildPath (Get-Date -Format "yyyyMM")
+        if (-not (Test-Path -Path $ArchivePath)) {
+            New-Item -ItemType Directory -Path $ArchivePath | Out-Null
+        }
+        $ArchiveFilePath = Join-Path -Path $ArchivePath -ChildPath $SourceFileName
+        Move-Item -Path $FilePath -Destination $ArchiveFilePath -Force
+        Log_Message $PayorName "File processed and archived successfully to: $ArchiveFilePath."
+
+    } catch {
+        Log_Message "N/A" "Error processing file $SourceFileName: $_"
+    } finally {
+        if ($SqlConnection.State -eq [System.Data.ConnectionState]::Open) {
+            $SqlConnection.Close()
+        }
+        if ($BulkCopy) {
+            $BulkCopy.Dispose()
+        }
     }
-    $ArchiveFilePath = Join-Path -Path $ArchivePath -ChildPath $SourceFileName
-    Move-Item -Path $FilePath -Destination $ArchiveFilePath -Force
-    Log_Message "File archived successfully to: $ArchiveFilePath."
 }
 
-# Final log
-Log_Message "CSV ETL process completed for all files in folder: $FolderPath."
+# Main: Process all files
+$Files = Get-ChildItem -Path $FolderPath -Filter "*.csv"
+if ($Files.Count -eq 0) {
+    Write-Host "No CSV files found in folder: $FolderPath"
+    exit
+}
+
+# Optional: Enable parallel processing if supported
+foreach ($File in $Files) {
+    Process_File $File.FullName
+}
+
+Log_Message "N/A" "CSV ETL process completed for all files in folder: $FolderPath."
