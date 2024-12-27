@@ -81,6 +81,9 @@ foreach ($File in $Files) {
         $BulkCopy.DestinationTableName = $TargetTable
         $BulkCopy.BatchSize = $BatchSize
 
+        # Add the SourceFileName column to the bulk copy column mappings
+        $BulkCopy.ColumnMappings.Add("SourceFileName", "SourceFileName")
+
         foreach ($Mapping in $Mappings) {
             $BulkCopy.ColumnMappings.Add($Mapping.IncomingColumnName, $Mapping.StandardizedColumnName)
         }
@@ -98,10 +101,15 @@ foreach ($File in $Files) {
             $DataTable.Columns.Add($Column)
         }
 
+        # Add SourceFileName column to DataTable
+        $SourceFileNameColumn = New-Object System.Data.DataColumn("SourceFileName")
+        $DataTable.Columns.Add($SourceFileNameColumn)
+
         while (-not $TextFieldParser.EndOfData) {
             $Fields = $TextFieldParser.ReadFields()
             $Row = $DataTable.NewRow()
             $Row.ItemArray = $Fields
+            $Row["SourceFileName" ] = $SourceFileName # Added to populate the SourceFileName for each row.
             $DataTable.Rows.Add($Row)
         }
 
