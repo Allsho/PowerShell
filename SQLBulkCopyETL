@@ -159,10 +159,12 @@ foreach ($File in $Files) {
         $CsvData = Load_CSV -FilePath $FilePath -SourceFileName $SourceFileName
         $BulkCopy, $SqlConnection = Initialize_BulkCopy -TargetTable $TargetTable -Mappings $Mappings -SourceFileName $SourceFileName
 
+        # Write data to SQL Server
         $BulkCopy.WriteToServer($CsvData)
+
         Log_Message "Bulk copy completed for file: $SourceFileName."
 
-        $BulkCopy.Close()
+        # Close connection and bulk copy
         $SqlConnection.Close()
 
         $ArchiveFilePath = Archive_File -FilePath $FilePath -ArchiveBasePath $ArchiveBasePath -SourceFileName $SourceFileName
