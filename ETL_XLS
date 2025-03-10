@@ -4,7 +4,7 @@
 
 # Configuration
 $ServerName = ""                              # SQL Server name or IP address
-$Database = "ClaimsStage"                     # Database to store the data
+$Database = ""                                # Database to store the data
 $FolderPath = ""                              # Directory containing .xls files to process
 $DataMappingTable = "ETL.Claim_Data_Mapping"  # Table containing column mappings
 $TableMappingTable = "ETL.Table_Mapping"      # Table mapping FilePattern to TargetTable
